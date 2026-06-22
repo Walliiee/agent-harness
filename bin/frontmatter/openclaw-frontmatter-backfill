@@ -1,0 +1,554 @@
+#!/usr/bin/env python3
+"""openclaw-frontmatter-backfill — synthesize YAML frontmatter for OpenClaw .md files.
+
+OpenClaw-aware mirror of `gbrain frontmatter generate --fix`. The upstream gbrain
+tool has no rules for our directory layout, so every file would land as `type: note`
+with no source — frontmatter for frontmatter's sake.
+
+This tool walks each workspace, infers semantically meaningful type/source/tags
+from the path + workspace, reads the first H1 for the title, pulls `created` from
+git history, and prepends a YAML block. .bak per file before any write.
+
+Coverage:
+  type    — derived from path segment (memory/, wiki/<category>/, meetings/, etc.)
+  source  — derived from workspace (per config/agents.map persona label)
+  title   — first H1 in content; falls back to humanized filename
+  created — first git commit touching the file; falls back to file mtime
+  updated — today
+  tags    — path segments + type
+
+Usage:
+  openclaw-frontmatter-backfill                                  # dry-run all workspaces
+  openclaw-frontmatter-backfill --workspace workspace            # scope to one
+  openclaw-frontmatter-backfill --apply                          # actually write + .bak
+  openclaw-frontmatter-backfill --apply --workspace workspace
+  openclaw-frontmatter-backfill --limit 5                        # dry-run cap (debug)
+  openclaw-frontmatter-backfill --json                           # machine-readable
+"""
+from __future__ import annotations
+
+import argparse
+import collections
+import json
+import os
+import re
+import subprocess
+import sys
+from datetime import date, datetime
+from pathlib import Path
+
+# ─── Workspace registry ──────────────────────────────────────────────────
+
+OPENCLAW_HOME = Path(os.environ.get("OPENCLAW_HOME", os.path.expanduser("~/.openclaw")))
+OPENCLAW = OPENCLAW_HOME
+
+
+def _load_agents_map():
+    """Return list of (agent_id, workspace_dir, persona) from config/agents.map."""
+    here = Path(__file__).resolve()
+    candidates = []
+    env_map = os.environ.get("AGENTS_MAP")
+    if env_map:
+        candidates.append(Path(env_map))
+    candidates.append(OPENCLAW_HOME / "config" / "agents.map")
+    candidates.append(here.parent.parent.parent / "config" / "agents.map")
+    for c in candidates:
+        try:
+            if c.is_file():
+                rows = []
+                for line in c.read_text(encoding="utf-8").splitlines():
+                    line = line.split("#", 1)[0].strip()
+                    if not line:
+                        continue
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        rows.append((parts[0], parts[1], parts[2]))
+                if rows:
+                    return rows
+        except OSError:
+            continue
+    return [("main", "workspace", "Orchestrator"), ("dev", "workspace-dev", "Developer")]
+
+
+AGENTS = _load_agents_map()
+# workspace-dir -> source label (persona). Lowercased so it reads as a source id.
+WORKSPACES: dict[str, str] = {ws: persona.lower() for _aid, ws, persona in AGENTS}
+
+# ─── Type inference ──────────────────────────────────────────────────────
+# Ordered most-specific → least. First match wins.
+
+TYPE_RULES: list[tuple[str, str, list[str]]] = [
+    # (path-segment pattern, type, extra tags)
+    ("memory/cold-storage/", "daily-memory", ["memory", "archived"]),
+    ("memory/dreaming/deep/", "dream-deep", ["memory", "dreaming"]),
+    ("memory/dreaming/light/", "dream-light", ["memory", "dreaming"]),
+    ("memory/dreaming/rem/",  "dream-rem",  ["memory", "dreaming"]),
+    ("memory/",               "daily-memory", ["memory", "daily"]),
+    ("wiki/agent-behaviors/", "agent-behavior", ["wiki"]),
+    ("wiki/projects/",        "project", ["wiki"]),
+    ("wiki/concepts/",        "concept", ["wiki"]),
+    ("wiki/companies/",       "company", ["wiki"]),
+    ("wiki/people/",          "person",  ["wiki"]),
+    ("wiki/tools/",           "tool",    ["wiki"]),
+    ("wiki/sources/",         "source",  ["wiki"]),
+    ("wiki/meetings/",        "meeting", ["wiki"]),
+    ("wiki/inbox/",           "inbox",   ["wiki"]),
+    ("wiki/",                 "wiki",    ["wiki"]),
+    ("meetings/",             "meeting", []),
+    ("audit/",                "audit", []),
+    ("tasks/",                "task", []),
+    ("handoffs/",             "handoff", []),
+    ("reports/",              "report", []),
+    ("skills/",               "skill-doc", ["skill"]),
+    ("agents/",               "agent-config", []),
+    ("tools/",                "tooling", []),
+    ("references/",           "reference", []),
+    ("documents/",            "document", []),
+    ("inbox/",                "inbox", []),
+]
+
+
+def infer_type(rel_path: str) -> tuple[str, list[str]]:
+    rp = rel_path.replace("\\", "/")
+    for pattern, t, tags in TYPE_RULES:
+        if rp.startswith(pattern) or f"/{pattern}" in f"/{rp}":
+            return t, list(tags)
+    return "note", []
+
+
+# ─── Title inference ─────────────────────────────────────────────────────
+
+H1_RE = re.compile(r"^\s*#\s+(.+?)\s*$", re.MULTILINE)
+DATE_PREFIX_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})[-_\s]*(.*)$")
+
+
+def humanize_filename(stem: str) -> str:
+    m = DATE_PREFIX_RE.match(stem)
+    if m:
+        dateprefix, tail = m.group(1), m.group(2)
+        if not tail:
+            return f"Memory — {dateprefix}"
+        tail = re.sub(r"[-_]+", " ", tail).strip()
+        return f"{dateprefix} — {tail.title()}"
+    return re.sub(r"[-_]+", " ", stem).title()
+
+
+def infer_title(content: str, file_stem: str) -> str:
+    m = H1_RE.search(content[:4000])
+    if m:
+        title = m.group(1).strip()
+        # Strip wiki-link or comment artifacts
+        title = re.sub(r"<!--.*?-->", "", title).strip()
+        if title and len(title) < 200:
+            return title
+    return humanize_filename(file_stem)
+
+
+def infer_description(content: str, title: str) -> str:
+    """First non-heading, non-empty sentence from the body, capped at 150 chars.
+    Used by QMD/gbrain as a retrieval hook. Falls back to title if no body prose."""
+    body = content[:8000]
+    # Strip frontmatter if somehow present
+    body = re.sub(r"\A---\r?\n.*?\r?\n---\r?\n", "", body, count=1, flags=re.DOTALL)
+    for raw in body.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("#") or line.startswith(">") or line.startswith("```"):
+            continue
+        if line.startswith("- ") or line.startswith("* ") or re.match(r"^\d+\.\s", line):
+            continue
+        # Skip inline-code-led relationship markers (e.g. `works_at` [[some-page]])
+        if line.startswith("`"):
+            continue
+        # Strip markdown emphasis/links for cleaner hook
+        line = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", line)
+        line = re.sub(r"\[\[([^\]]+)\]\]", r"\1", line)
+        line = re.sub(r"[*_`]", "", line)
+        # First sentence (up to . or ; or 150 chars)
+        sentence = re.split(r"(?<=[.;])\s+", line, maxsplit=1)[0]
+        sentence = sentence.strip().rstrip(".")
+        if len(sentence) > 150:
+            sentence = sentence[:147].rstrip() + "..."
+        # Minimum length floor so we don't pick noise (single words, abbreviations)
+        if len(sentence) >= 25:
+            return sentence
+    return title
+
+
+# ─── Date inference ──────────────────────────────────────────────────────
+
+ISO_DATE_RE = re.compile(r"(\d{4}-\d{2}-\d{2})")
+
+
+def infer_created(abs_path: Path, repo_root: Path) -> str:
+    name_match = ISO_DATE_RE.search(abs_path.stem)
+    if name_match:
+        return name_match.group(1)
+    try:
+        r = subprocess.run(
+            ["git", "-C", str(repo_root), "log", "--diff-filter=A", "--follow",
+             "--format=%aI", "--", str(abs_path.relative_to(repo_root))],
+            capture_output=True, text=True, timeout=5,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            lines = [l for l in r.stdout.strip().splitlines() if l]
+            if lines:
+                return lines[-1][:10]
+    except Exception:
+        pass
+    try:
+        ts = abs_path.stat().st_mtime
+        return datetime.fromtimestamp(ts).date().isoformat()
+    except Exception:
+        return date.today().isoformat()
+
+
+# ─── Frontmatter rendering ───────────────────────────────────────────────
+
+def has_frontmatter(content: str) -> bool:
+    head = content.lstrip()
+    return head.startswith("---\n") or head.startswith("---\r\n")
+
+
+def yaml_escape(s: str) -> str:
+    if any(c in s for c in [":", "#", "'", "\"", "\n", "[", "]", "{", "}", "*", "&", "?", "|", "<", ">", "=", "!", "%", "@", "`"]):
+        return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    return s
+
+
+def render_frontmatter(*, title: str, ftype: str, created: str, updated: str,
+                        source: str, tags: list[str], name: str, description: str) -> str:
+    """Render canonical hybrid frontmatter (resolved 2026-06-11).
+
+    Key order: gbrain quartet first (type/title/tags — what gbrain extracts to
+    dedicated pages.{type,title,tags} columns per markdown.ts:96-99), then
+    Claude/QMD hooks (name/description), then dates/source. No metadata: nesting.
+    """
+    tagstr = ", ".join(yaml_escape(t) for t in tags) if tags else ""
+    block = ["---", f"type: {ftype}", f"title: {yaml_escape(title)}"]
+    if tagstr:
+        block.append(f"tags: [{tagstr}]")
+    block.extend([
+        f"name: {name}",
+        f"description: {yaml_escape(description)}",
+        f"created: {created}",
+        f"updated: {updated}",
+        f"source: {source}",
+        "---",
+    ])
+    return "\n".join(block) + "\n\n"
+
+
+# ─── Walker ──────────────────────────────────────────────────────────────
+
+SKIP_DIRS = {".git", "node_modules", ".bun", ".venv", "__pycache__", "dist", "build"}
+
+
+def walk_workspace(ws_rel: str, source: str, subpath: str | None = None) -> list[dict]:
+    base = OPENCLAW / ws_rel
+    if not base.is_dir():
+        return []
+    walk_root = base / subpath if subpath else base
+    if not walk_root.is_dir():
+        return []
+    results: list[dict] = []
+    today = date.today().isoformat()
+    for root, dirs, files in os.walk(walk_root):
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+        for fname in files:
+            if not fname.endswith(".md"):
+                continue
+            abs_path = Path(root) / fname
+            try:
+                rel_from_ws = abs_path.relative_to(base).as_posix()
+            except ValueError:
+                continue
+            try:
+                content = abs_path.read_text(encoding="utf-8", errors="replace")
+            except Exception as e:
+                results.append({"path": str(abs_path), "skip": f"read-error: {e}"})
+                continue
+            if has_frontmatter(content):
+                continue
+            ftype, type_tags = infer_type(rel_from_ws)
+            title = infer_title(content, abs_path.stem)
+            description = infer_description(content, title)
+            name = abs_path.stem
+            created = infer_created(abs_path, base)
+            ws_tag = ws_rel.split("/")[-1].replace("workspace-", "") or "workspace"
+            tags = list(dict.fromkeys(type_tags + [ws_tag]))
+            fm = render_frontmatter(
+                title=title, ftype=ftype, created=created, updated=today,
+                source=source, tags=tags, name=name, description=description,
+            )
+            results.append({
+                "path": str(abs_path),
+                "rel": rel_from_ws,
+                "ws": ws_rel,
+                "source": source,
+                "type": ftype,
+                "title": title,
+                "created": created,
+                "tags": tags,
+                "frontmatter": fm,
+            })
+    return results
+
+
+FM_BLOCK_RE = re.compile(r"\A(---\r?\n)(.*?)(\r?\n---\r?\n)", re.DOTALL)
+
+
+def fm_has_type(fm_body: str) -> bool:
+    for line in fm_body.splitlines():
+        if re.match(r"^\s*type\s*:", line):
+            return True
+    return False
+
+
+def inject_type(content: str, ftype: str) -> str | None:
+    m = FM_BLOCK_RE.match(content)
+    if not m:
+        return None
+    opener, body, closer = m.group(1), m.group(2), m.group(3)
+    if fm_has_type(body):
+        return None
+    nl = "\r\n" if opener.endswith("\r\n") else "\n"
+    body_lines = body.split(nl)
+    insert_at = 0
+    for i, line in enumerate(body_lines):
+        if re.match(r"^\s*title\s*:", line):
+            insert_at = i + 1
+            break
+    body_lines.insert(insert_at, f"type: {ftype}")
+    new_body = nl.join(body_lines)
+    return opener + new_body + closer + content[m.end():]
+
+
+def walk_for_missing_type(ws_rel: str, source: str, subpath: str | None = None) -> list[dict]:
+    base = OPENCLAW / ws_rel
+    if not base.is_dir():
+        return []
+    walk_root = base / subpath if subpath else base
+    if not walk_root.is_dir():
+        return []
+    results: list[dict] = []
+    for root, dirs, files in os.walk(walk_root):
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+        for fname in files:
+            if not fname.endswith(".md"):
+                continue
+            abs_path = Path(root) / fname
+            try:
+                rel_from_ws = abs_path.relative_to(base).as_posix()
+            except ValueError:
+                continue
+            try:
+                content = abs_path.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+            if not has_frontmatter(content):
+                continue
+            m = FM_BLOCK_RE.match(content)
+            if not m:
+                continue
+            if fm_has_type(m.group(2)):
+                continue
+            ftype, _tags = infer_type(rel_from_ws)
+            new_content = inject_type(content, ftype)
+            if new_content is None:
+                continue
+            results.append({
+                "path": str(abs_path),
+                "rel": rel_from_ws,
+                "ws": ws_rel,
+                "source": source,
+                "type": ftype,
+                "new_content": new_content,
+            })
+    return results
+
+
+def apply_type_injection(item: dict) -> tuple[bool, str]:
+    p = Path(item["path"])
+    try:
+        original = p.read_text(encoding="utf-8")
+    except Exception as e:
+        return False, f"read: {e}"
+    bak = p.with_suffix(p.suffix + ".bak2")
+    try:
+        bak.write_text(original, encoding="utf-8")
+    except Exception as e:
+        return False, f"bak: {e}"
+    try:
+        p.write_text(item["new_content"], encoding="utf-8")
+    except Exception as e:
+        return False, f"write: {e}"
+    return True, "ok"
+
+
+def apply_one(item: dict) -> tuple[bool, str]:
+    p = Path(item["path"])
+    try:
+        original = p.read_text(encoding="utf-8")
+    except Exception as e:
+        return False, f"read: {e}"
+    bak = p.with_suffix(p.suffix + ".bak")
+    try:
+        bak.write_text(original, encoding="utf-8")
+    except Exception as e:
+        return False, f"bak: {e}"
+    try:
+        p.write_text(item["frontmatter"] + original, encoding="utf-8")
+    except Exception as e:
+        return False, f"write: {e}"
+    return True, "ok"
+
+
+def format_dry_run(results_by_ws: dict[str, list[dict]], limit: int | None) -> str:
+    lines = []
+    grand = 0
+    for ws, items in results_by_ws.items():
+        if not items:
+            continue
+        type_counts = collections.Counter(it["type"] for it in items)
+        lines.append(f"\n=== {ws} ({len(items)} files need frontmatter) ===")
+        for t, c in sorted(type_counts.items(), key=lambda x: -x[1]):
+            lines.append(f"  {c:5d} × type: {t}")
+        lines.append("  Sample (first 3):")
+        for it in items[:3]:
+            lines.append(f"    {it['rel']}")
+            for fmline in it["frontmatter"].strip().splitlines():
+                lines.append(f"      {fmline}")
+        grand += len(items)
+        if limit and grand >= limit:
+            break
+    lines.append("")
+    lines.append(f"TOTAL files needing frontmatter: {grand}")
+    return "\n".join(lines)
+
+
+def run_add_missing_type(targets: dict[str, str], args) -> int:
+    results_by_ws: dict[str, list[dict]] = {}
+    for ws, source in targets.items():
+        results_by_ws[ws] = walk_for_missing_type(ws, source, args.subpath)
+
+    grand = sum(len(v) for v in results_by_ws.values())
+    type_counts_total: collections.Counter = collections.Counter()
+    for items in results_by_ws.values():
+        for it in items:
+            type_counts_total[it["type"]] += 1
+
+    if not args.json:
+        print(f"\n=== add-missing-type: {grand} files need type field ===")
+        for ws, items in results_by_ws.items():
+            if not items:
+                continue
+            tc = collections.Counter(it["type"] for it in items)
+            print(f"\n  {ws} ({len(items)} files)")
+            for t, c in sorted(tc.items(), key=lambda x: -x[1]):
+                print(f"    {c:5d} → type: {t}")
+            for it in items[:2]:
+                print(f"    sample: {it['rel']} → type: {it['type']}")
+        print(f"\n  TOTAL types being injected:")
+        for t, c in sorted(type_counts_total.items(), key=lambda x: -x[1]):
+            print(f"    {c:5d} × {t}")
+
+    applied = None
+    if args.apply:
+        applied = collections.defaultdict(list)
+        count = 0
+        for ws, items in results_by_ws.items():
+            for it in items:
+                if args.limit is not None and count >= args.limit:
+                    break
+                ok, msg = apply_type_injection(it)
+                applied[ws].append({"path": it["path"], "type": it["type"], "ok": ok, "msg": msg})
+                count += 1
+            if args.limit is not None and count >= args.limit:
+                break
+        if not args.json:
+            print("\n--- APPLIED ---")
+            for ws, rows in applied.items():
+                ok = sum(1 for r in rows if r["ok"])
+                fail = sum(1 for r in rows if not r["ok"])
+                print(f"  {ws}: {ok} ok, {fail} fail")
+                for r in rows:
+                    if not r["ok"]:
+                        print(f"    FAIL {r['path']}: {r['msg']}")
+
+    if args.json:
+        print(json.dumps({
+            "mode": "add-missing-type",
+            "per_workspace_count": {k: len(v) for k, v in results_by_ws.items()},
+            "type_totals": dict(type_counts_total),
+            "applied": dict(applied) if applied else None,
+        }, indent=2, default=str))
+
+    return 0
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(prog="openclaw-frontmatter-backfill")
+    p.add_argument("--workspace", help="scope to one workspace (default: all)")
+    p.add_argument("--subpath", help="scope to a subdir within the workspace (e.g. 'memory' or 'wiki/agent-behaviors')")
+    p.add_argument("--apply", action="store_true", help="actually write (with .bak)")
+    p.add_argument("--limit", type=int, default=None, help="cap files processed in apply mode")
+    p.add_argument("--json", action="store_true", help="machine-readable output")
+    p.add_argument("--add-missing-type", action="store_true",
+                   help="mode: inject 'type:' into files that already have frontmatter but no type field (.bak2 suffix)")
+    args = p.parse_args()
+
+    targets = (
+        {args.workspace: WORKSPACES[args.workspace]}
+        if args.workspace and args.workspace in WORKSPACES
+        else WORKSPACES
+    )
+
+    if args.add_missing_type:
+        return run_add_missing_type(targets, args)
+
+    results_by_ws: dict[str, list[dict]] = {}
+    for ws, source in targets.items():
+        results_by_ws[ws] = walk_workspace(ws, source, args.subpath)
+
+    applied = None
+    if args.apply:
+        applied: dict[str, list[dict]] = collections.defaultdict(list)
+        count = 0
+        for ws, items in results_by_ws.items():
+            for it in items:
+                if args.limit is not None and count >= args.limit:
+                    break
+                ok, msg = apply_one(it)
+                applied[ws].append({"path": it["path"], "ok": ok, "msg": msg})
+                count += 1
+            if args.limit is not None and count >= args.limit:
+                break
+
+    if args.json:
+        print(json.dumps({
+            "per_workspace_count": {k: len(v) for k, v in results_by_ws.items()},
+            "samples": {k: v[:3] for k, v in results_by_ws.items()},
+            "applied": {k: applied[k] if applied else None for k in results_by_ws} if applied else None,
+        }, indent=2))
+    else:
+        print(format_dry_run(results_by_ws, args.limit if not args.apply else None))
+        if applied:
+            print("\n--- APPLIED ---")
+            for ws, rows in applied.items():
+                ok = sum(1 for r in rows if r["ok"])
+                fail = sum(1 for r in rows if not r["ok"])
+                print(f"  {ws}: {ok} ok, {fail} fail")
+                for r in rows:
+                    if not r["ok"]:
+                        print(f"    FAIL {r['path']}: {r['msg']}")
+
+    grand = sum(len(v) for v in results_by_ws.values())
+    if args.apply:
+        return 0
+    return 1 if grand > 0 else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

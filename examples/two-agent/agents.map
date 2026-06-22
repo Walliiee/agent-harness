@@ -1,0 +1,6 @@
+# agents.map — a filled-in two-agent example (main + dev).
+# Format:  <agent-id>  <workspace-dir>  <persona-label>
+# This is what adapt.py renders for the default roster.
+
+main   workspace       Orchestrator
+dev    workspace-dev   Developer

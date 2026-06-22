@@ -1,0 +1,69 @@
+#!/usr/bin/env python3
+"""B2: deterministic, INDEPENDENT verification that artifact-producing crons which reported
+success actually produced their dated output — without trusting the agent, or even the
+agent-run quality-gate, to self-verify. The Anthropic "separate skeptical evaluator" /
+OpenAI "mechanical enforcement" pattern, done as a command cron.
+
+For each check: if the cron ran with status=ok today (per the gateway's authoritative
+cron_run_logs) but its expected artifact is missing or stale, that's a claimed-success that
+didn't happen -> exit non-zero so the global cron failureDestination alerts the operator.
+
+Extend CHECKS as crons gain hard, dated artifacts. Each check is a tuple of
+(cron name substring, artifact path template relative to ${OPENCLAW_HOME}). The template
+may use {today} for the current date. Crons already gated by a deterministic verifier
+(memory-capture-audit for daily memory; command crons via exit code) are not duplicated here.
+"""
+import sqlite3, os, sys, time
+from datetime import datetime
+
+OPENCLAW_HOME = os.environ.get("OPENCLAW_HOME", os.path.expanduser("~/.openclaw"))
+DB = os.path.join(OPENCLAW_HOME, "state", "openclaw.sqlite")
+HOME = OPENCLAW_HOME
+TODAY = datetime.now().strftime("%Y-%m-%d")
+
+# (cron name substring, artifact path template relative to ${OPENCLAW_HOME})
+# Freshness is verified against WHEN THE CRON RAN, not wall-clock now — so the check is
+# correct whenever it runs. The artifact must have been written at/after the cron's run.
+# Populate per deployment with the artifact-producing crons you want to hold accountable.
+CHECKS = [
+]
+SLACK_S = 300  # allow the artifact mtime to predate run start by up to 5 min
+
+
+def latest_run_today(con, name_sub):
+    rows = con.execute(
+        "SELECT crl.status, crl.run_at_ms FROM cron_run_logs crl "
+        "JOIN cron_jobs cj ON cj.job_id = crl.job_id "
+        "WHERE cj.name LIKE ? ORDER BY crl.run_at_ms DESC LIMIT 5", (f"%{name_sub}%",)).fetchall()
+    for status, run_at in rows:
+        if datetime.fromtimestamp((run_at or 0) / 1000).strftime("%Y-%m-%d") == TODAY:
+            return status, (run_at or 0) / 1000
+    return None, None
+
+
+def main():
+    con = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+    violations = []
+    for name_sub, tmpl in CHECKS:
+        status, run_at_s = latest_run_today(con, name_sub)
+        if status != "ok":
+            continue  # didn't run today, or already errored (its own failure alert covers it)
+        rel = tmpl.format(today=TODAY)
+        path = os.path.join(HOME, rel)
+        if not os.path.exists(path):
+            violations.append(f"{name_sub}: reported ok but artifact MISSING: {rel}")
+        elif os.path.getmtime(path) < run_at_s - SLACK_S:
+            stale_min = (run_at_s - os.path.getmtime(path)) / 60
+            violations.append(f"{name_sub}: reported ok but artifact NOT updated by this run "
+                              f"(written {stale_min:.0f}min before run start): {rel}")
+    con.close()
+    if violations:
+        print("CRON CLAIM MISMATCH — agent reported success but the artifact isn't there:")
+        for v in violations:
+            print("  - " + v)
+        sys.exit(1)
+    print("OK — all checked crons' artifacts present and fresh")
+
+
+if __name__ == "__main__":
+    main()

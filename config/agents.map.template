@@ -1,0 +1,19 @@
+# agents.map — the single place that declares your agents.
+#
+# In the original system this mapping was hardcoded across ~6 scripts
+# (wire-skills, cron-postmortem-watch, promote-queue-status, ...). The harness
+# reads it from here instead, so adding/renaming an agent is a one-file edit.
+#
+# Format (one agent per line):  <agent-id>  <workspace-dir>  <persona-label>
+#   agent-id      : short id used by the gateway + scripts (e.g. main, dev)
+#   workspace-dir : path under ${OPENCLAW_HOME}, e.g. workspace or workspace-dev
+#   persona-label : human display name (free choice)
+#
+# The two-agent default below is the minimal working set. Add rows to grow.
+
+main   workspace       Orchestrator
+dev    workspace-dev   Developer
+
+# Examples you might add (uncomment + rename to taste):
+# research   workspace-research   Researcher
+# ops        workspace-ops        Operator

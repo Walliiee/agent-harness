@@ -1,0 +1,34 @@
+# Never commit real state, secrets, or generated content — this repo ships
+# templates and scripts only. The harness creates these in the USER's setup.
+
+# Secrets / live config
+secrets.json
+*.local.json
+.env
+.env.*
+openclaw.json            # real config; only openclaw.json.template is tracked
+
+# Live state (hippocampus / runtime)
+memory/
+sessions/
+incidents/
+logs/
+skill-runs/
+*.log
+
+# Index / DB backends
+*.pglite/
+*.sqlite
+*.sqlite3
+qmd-cache/
+**/xdg-cache/
+pg-data/
+*.sql.gz
+
+# OS / editor
+.DS_Store
+*.swp
+__pycache__/
+*.pyc
+.venv/
+node_modules/

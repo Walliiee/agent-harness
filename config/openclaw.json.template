@@ -1,0 +1,965 @@
+{
+  "meta": {
+    "lastTouchedVersion": "2026.6.9"
+  },
+  "env": {
+    "ANTHROPIC_API_KEY": "<REDACTED_ANTHROPIC_API_KEY>",
+    "BRAVE_API_KEY": "<REDACTED_BRAVE_API_KEY>",
+    "GEMINI_API_KEY": "<REDACTED_GEMINI_API_KEY>",
+    "GOGCLI_STORE_DIR": "${OPENCLAW_HOME}/workspace/config/gog",
+    "GOGCLI_STORE_TYPE": "file",
+    "OLLAMA_API_KEY": "ollama-local",
+    "TAVILY_API_KEY": "<REDACTED_TAVILY_API_KEY>",
+    "GBRAIN_TOKEN_MAIN": "<REDACTED_GBRAIN_TOKEN_MAIN>",
+    "GBRAIN_TOKEN_DEV": "<REDACTED_GBRAIN_TOKEN_DEV>"
+  },
+  "browser": {
+    "executablePath": "/Applications/Firefox.app/Contents/MacOS/firefox"
+  },
+  "auth": {
+    "profiles": {
+      "ollama:default": {
+        "provider": "ollama",
+        "mode": "api_key"
+      },
+      "anthropic:claude-cli": {
+        "provider": "claude-cli",
+        "mode": "oauth"
+      },
+      "google:default": {
+        "provider": "google",
+        "mode": "api_key"
+      },
+      "openai:<REDACTED_EMAIL>": {
+        "provider": "openai",
+        "mode": "oauth",
+        "email": "<REDACTED_EMAIL>"
+      }
+    },
+    "order": {
+      "anthropic": [
+        "anthropic:claude-cli"
+      ]
+    }
+  },
+  "models": {
+    "mode": "replace",
+    "providers": {
+      "ollama": {
+        "baseUrl": "http://127.0.0.1:11434",
+        "apiKey": {
+          "source": "env",
+          "provider": "env",
+          "id": "OLLAMA_API_KEY"
+        },
+        "api": "ollama",
+        "timeoutSeconds": 180,
+        "models": [
+          {
+            "id": "glm-5.2:cloud",
+            "name": "glm-5.2:cloud",
+            "api": "ollama",
+            "reasoning": true,
+            "input": [
+              "text"
+            ],
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0
+            },
+            "contextWindow": 202752,
+            "maxTokens": 16384,
+            "params": {
+              "num_ctx": 202752
+            },
+            "compat": {
+              "supportsTools": true
+            }
+          },
+          {
+            "id": "kimi-k2.7-code:cloud",
+            "name": "kimi-k2.7-code:cloud",
+            "api": "ollama",
+            "reasoning": true,
+            "input": [
+              "text",
+              "image"
+            ],
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0
+            },
+            "contextWindow": 262144,
+            "maxTokens": 16384,
+            "params": {
+              "num_ctx": 262144
+            },
+            "compat": {
+              "supportsTools": true
+            }
+          },
+          {
+            "id": "minimax-m3:cloud",
+            "name": "minimax-m3:cloud",
+            "api": "ollama",
+            "reasoning": true,
+            "input": [
+              "text"
+            ],
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0
+            },
+            "contextWindow": 262144,
+            "maxTokens": 16384,
+            "params": {
+              "num_ctx": 262144
+            },
+            "compat": {
+              "supportsTools": true
+            }
+          }
+        ]
+      },
+      "google": {
+        "api": "google-generative-ai",
+        "apiKey": {
+          "source": "env",
+          "provider": "env",
+          "id": "GEMINI_API_KEY"
+        },
+        "timeoutSeconds": 600,
+        "contextWindow": 195000,
+        "maxTokens": 16384,
+        "models": [
+          {
+            "id": "gemini-3.5-flash",
+            "name": "gemini-3.5-flash",
+            "reasoning": true,
+            "input": [
+              "text",
+              "image",
+              "video",
+              "audio"
+            ],
+            "cost": {
+              "input": 1.5,
+              "output": 9
+            },
+            "contextWindow": 1048576,
+            "maxTokens": 65536,
+            "compat": {
+              "supportsTools": true
+            }
+          }
+        ],
+        "baseUrl": "https://generativelanguage.googleapis.com/v1beta"
+      },
+      "anthropic": {
+        "models": [
+          {
+            "id": "claude-sonnet-4-6",
+            "name": "claude-sonnet-4-6",
+            "input": [
+              "text",
+              "image"
+            ],
+            "reasoning": true,
+            "contextWindow": 195000,
+            "maxTokens": 16384,
+            "compat": {
+              "supportsTools": true
+            }
+          },
+          {
+            "id": "claude-opus-4-8",
+            "name": "claude-opus-4-8",
+            "input": [
+              "text",
+              "image"
+            ],
+            "reasoning": true,
+            "contextWindow": 1024000,
+            "maxTokens": 16384,
+            "compat": {
+              "supportsTools": true
+            }
+          }
+        ]
+      },
+      "openai": {
+        "timeoutSeconds": 240,
+        "models": [
+          {
+            "id": "gpt-5.5",
+            "name": "gpt-5.5",
+            "input": [
+              "text",
+              "image"
+            ],
+            "reasoning": true,
+            "contextWindow": 195000,
+            "maxTokens": 16384,
+            "compat": {
+              "supportsTools": true
+            }
+          }
+        ]
+      },
+      "codex": {
+        "models": [
+          {
+            "id": "gpt-5.5",
+            "name": "gpt-5.5",
+            "input": [
+              "text",
+              "image"
+            ],
+            "reasoning": true,
+            "contextWindow": 266000,
+            "maxTokens": 16384,
+            "compat": {
+              "supportsTools": true
+            }
+          }
+        ]
+      }
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "openai/gpt-5.5",
+        "fallbacks": [
+          "ollama/kimi-k2.7-code:cloud",
+          "ollama/glm-5.2:cloud",
+          "ollama/minimax-m3:cloud"
+        ]
+      },
+      "imageModel": "ollama/kimi-k2.7-code:cloud",
+      "models": {
+        "anthropic/claude-opus-4-8": {
+          "alias": "opus",
+          "params": {
+            "cacheRetention": "long"
+          },
+          "agentRuntime": {
+            "id": "claude-cli"
+          }
+        },
+        "ollama/glm-5.2:cloud": {
+          "alias": "glmpro",
+          "params": {
+            "thinkingDefault": "low"
+          }
+        },
+        "ollama/kimi-k2.7-code:cloud": {
+          "alias": "kimi",
+          "params": {
+            "cacheRetention": "long",
+            "thinkingDefault": "low"
+          }
+        },
+        "google/gemini-3.5-flash": {
+          "alias": "flash",
+          "params": {
+            "thinkingDefault": "medium",
+            "maxTokens": 16384
+          }
+        },
+        "ollama/minimax-m3:cloud": {
+          "alias": "minimax"
+        },
+        "codex/gpt-5.5": {
+          "alias": "codex",
+          "agentRuntime": {
+            "id": "codex"
+          }
+        },
+        "anthropic/claude-sonnet-4-6": {
+          "agentRuntime": {
+            "id": "claude-cli"
+          }
+        },
+        "openai/gpt-5.5": {
+          "alias": "gpt"
+        }
+      },
+      "workspace": "${OPENCLAW_HOME}/workspace",
+      "bootstrapMaxChars": 24000,
+      "contextLimits": {
+        "memoryGetMaxChars": 50000,
+        "memoryGetDefaultLines": 80
+      },
+      "memorySearch": {
+        "enabled": true,
+        "experimental": {
+          "sessionMemory": false
+        },
+        "cache": {
+          "enabled": true
+        },
+        "query": {
+          "hybrid": {
+            "enabled": true,
+            "mmr": {
+              "enabled": true
+            },
+            "temporalDecay": {
+              "enabled": true
+            }
+          }
+        }
+      },
+      "contextPruning": {
+        "mode": "cache-ttl",
+        "ttl": "5m"
+      },
+      "compaction": {
+        "mode": "default",
+        "notifyUser": true,
+        "truncateAfterCompaction": true,
+        "maxActiveTranscriptBytes": "20mb",
+        "keepRecentTokens": 20000,
+        "reserveTokens": 16384,
+        "memoryFlush": {
+          "enabled": true
+        }
+      },
+      "thinkingDefault": "low",
+      "heartbeat": {
+        "every": "2h",
+        "model": "ollama/minimax-m3:cloud",
+        "target": "none",
+        "to": "${HARNESS_TG_CHAT_ID}",
+        "prompt": "DEFAULT REPLY IS SILENCE. Only speak if something is actually wrong.\n\nRead HEARTBEAT.md if it exists (workspace context). Follow it strictly. Do not infer or repeat old tasks from prior chats. If the heartbeat_respond tool is available and nothing needs attention, call heartbeat_respond with notify=false. If that tool is not available and nothing needs attention, reply exactly HEARTBEAT_OK with no other text. Never narrate checks, never include tool results, and never send green/all-clear summaries. Never reply with prose like 'no issues' or 'all quiet' or 'nothing to report' — those are not alerts. If something is wrong or needs attention, reply only with the brief alert text.",
+        "ackMaxChars": 500,
+        "lightContext": true,
+        "isolatedSession": true,
+        "activeHours": {
+          "start": "08:00",
+          "end": "23:50",
+          "timezone": "Europe/Copenhagen"
+        }
+      },
+      "subagents": {
+        "maxConcurrent": 4,
+        "maxSpawnDepth": 1,
+        "model": {
+          "primary": "ollama/kimi-k2.7-code:cloud",
+          "fallbacks": [
+            "ollama/minimax-m3:cloud",
+            "ollama/glm-5.2:cloud",
+            "codex/gpt-5.5"
+          ]
+        },
+        "runTimeoutSeconds": 900
+      },
+      "sandbox": {
+        "mode": "off"
+      },
+      "maxConcurrent": 4,
+      "verboseDefault": "off",
+      "contextInjection": "always",
+      "skills": []
+    },
+    "list": [
+      {
+        "id": "main",
+        "model": {
+          "primary": "openai/gpt-5.5",
+          "fallbacks": [
+            "ollama/kimi-k2.7-code:cloud",
+            "ollama/glm-5.2:cloud",
+            "ollama/minimax-m3:cloud"
+          ]
+        },
+        "verboseDefault": "off",
+        "memorySearch": {
+          "enabled": true,
+          "qmd": {
+            "extraCollections": [
+              {
+                "path": "${OPENCLAW_HOME}/workspace",
+                "name": "memory-root",
+                "pattern": "MEMORY.md"
+              }
+            ]
+          }
+        },
+        "heartbeat": {
+          "every": "2h",
+          "accountId": "main",
+          "skipWhenBusy": true
+        },
+        "tools": {
+          "fs": {
+            "workspaceOnly": false
+          },
+          "exec": {
+            "security": "full",
+            "ask": "off",
+            "applyPatch": {
+              "workspaceOnly": false
+            }
+          },
+          "alsoAllow": [
+            "sessions_list",
+            "sessions_send",
+            "sessions_spawn",
+            "sessions_yield",
+            "subagents"
+          ]
+        },
+        "models": {
+          "codex/gpt-5.5": {
+            "alias": "codex"
+          },
+          "openai/gpt-5.5": {
+            "alias": "gpt"
+          }
+        },
+        "skills": [
+          "qmd",
+          "memory-retrieve",
+          "gbrain-query",
+          "reports",
+          "session-cleanup",
+          "wiki-write",
+          "workspace-audit",
+          "memory-dup-check",
+          "memory-capture",
+          "memory-promote",
+          "frontmatter-guard",
+          "drift-ack",
+          "smoke-test",
+          "github",
+          "tavily",
+          "browser-automation",
+          "dispatching-parallel-agents"
+        ]
+      },
+      {
+        "id": "dev",
+        "name": "Developer",
+        "workspace": "${OPENCLAW_HOME}/workspace-dev",
+        "model": {
+          "primary": "openai/gpt-5.5",
+          "fallbacks": [
+            "ollama/kimi-k2.7-code:cloud",
+            "ollama/glm-5.2:cloud"
+          ]
+        },
+        "thinkingDefault": "low",
+        "verboseDefault": "off",
+        "memorySearch": {
+          "enabled": true
+        },
+        "heartbeat": {
+          "every": "4h",
+          "accountId": "dev",
+          "prompt": "Read HEARTBEAT.md if it exists (workspace context). Follow it strictly. Do not infer or repeat old tasks from prior chats. If the heartbeat_respond tool is available, call it with notify=false and no notificationText unless something actually needs attention. If that tool is not available, reply exactly HEARTBEAT_OK with no other text. NEVER narrate checks, NEVER include tool results, NEVER send green/all-clear summaries, NEVER call message(action=send) for progress or clean/no-op results, and NEVER reply with prose like 'no dirty repos' or 'all quiet' — those are not alerts and must be suppressed. Only emit a visible reply when there is a real blocker, error, or stale state worth flagging; in that case return only the brief alert text."
+        },
+        "identity": {
+          "name": "Developer",
+          "emoji": "🔨"
+        },
+        "sandbox": {
+          "mode": "off"
+        },
+        "tools": {
+          "fs": {
+            "workspaceOnly": false
+          },
+          "exec": {
+            "security": "full",
+            "ask": "off",
+            "applyPatch": {
+              "workspaceOnly": false
+            }
+          },
+          "alsoAllow": [
+            "sessions_list",
+            "sessions_send",
+            "sessions_spawn",
+            "sessions_yield",
+            "subagents"
+          ]
+        },
+        "models": {
+          "codex/gpt-5.5": {
+            "alias": "codex"
+          },
+          "openai/gpt-5.5": {
+            "alias": "gpt"
+          }
+        },
+        "skills": [
+          "qmd",
+          "memory-retrieve",
+          "gbrain-query",
+          "reports",
+          "wiki-write",
+          "session-cleanup",
+          "workspace-audit",
+          "github",
+          "gh-issues",
+          "diffs",
+          "test-driven-development",
+          "smoke-test",
+          "code-review",
+          "decision-log",
+          "ship-check"
+        ],
+        "subagents": {
+          "model": {
+            "primary": "ollama/kimi-k2.7-code:cloud",
+            "fallbacks": [
+              "ollama/glm-5.2:cloud"
+            ]
+          }
+        }
+      }
+    ]
+  },
+  "tools": {
+    "profile": "coding",
+    "alsoAllow": [],
+    "web": {
+      "search": {
+        "enabled": true,
+        "provider": "tavily",
+        "openaiCodex": {}
+      },
+      "fetch": {
+        "enabled": true
+      }
+    },
+    "media": {
+      "image": {
+        "enabled": true,
+        "maxBytes": 10485760,
+        "maxChars": 4000
+      }
+    },
+    "agentToAgent": {
+      "enabled": true,
+      "allow": [
+        "main",
+        "dev"
+      ]
+    },
+    "exec": {
+      "security": "deny",
+      "ask": "off"
+    },
+    "fs": {
+      "workspaceOnly": true
+    },
+    "elevated": {
+      "enabled": true
+    },
+    "links": {
+      "enabled": true
+    },
+    "sessions": {
+      "visibility": "all"
+    }
+  },
+  "bindings": [
+    {
+      "agentId": "main",
+      "match": {
+        "channel": "telegram",
+        "accountId": "main"
+      }
+    },
+    {
+      "agentId": "dev",
+      "match": {
+        "channel": "telegram",
+        "accountId": "dev"
+      }
+    }
+  ],
+  "commands": {
+    "native": true,
+    "nativeSkills": true,
+    "restart": true,
+    "ownerDisplay": "raw",
+    "config": true,
+    "debug": true,
+    "mcp": true,
+    "bash": true,
+    "text": true,
+    "plugins": true,
+    "useAccessGroups": true,
+    "ownerAllowFrom": [
+      "telegram:${HARNESS_TG_CHAT_ID}"
+    ]
+  },
+  "session": {
+    "dmScope": "per-channel-peer",
+    "maintenance": {
+      "mode": "enforce",
+      "pruneAfter": "2d"
+    }
+  },
+  "hooks": {
+    "internal": {
+      "enabled": true,
+      "entries": {
+        "boot-md": {
+          "enabled": false
+        },
+        "bootstrap-extra-files": {
+          "enabled": true
+        },
+        "command-logger": {
+          "enabled": true
+        },
+        "session-memory": {
+          "enabled": false
+        },
+        "compaction-notifier": {
+          "enabled": true
+        }
+      }
+    },
+    "enabled": true,
+    "allowRequestSessionKey": false,
+    "token": "<REDACTED_TOKEN>",
+    "defaultSessionKey": "hook:ingress",
+    "allowedAgentIds": [
+      "main",
+      "dev"
+    ],
+    "allowedSessionKeyPrefixes": [
+      "hook:"
+    ]
+  },
+  "channels": {
+    "telegram": {
+      "accounts": {
+        "main": {
+          "allowFrom": [
+            "${HARNESS_TG_CHAT_ID}"
+          ],
+          "botToken": {
+            "source": "file",
+            "provider": "local",
+            "id": "/TELEGRAM_TOKEN_MAIN"
+          },
+          "dmPolicy": "allowlist",
+          "groupAllowFrom": [
+            "${HARNESS_TG_CHAT_ID}"
+          ],
+          "groupPolicy": "allowlist",
+          "streaming": {
+            "preview": {
+              "toolProgress": false
+            }
+          },
+          "customCommands": []
+        },
+        "dev": {
+          "allowFrom": [
+            "${HARNESS_TG_CHAT_ID}"
+          ],
+          "botToken": {
+            "source": "file",
+            "provider": "local",
+            "id": "/TELEGRAM_TOKEN_DEV"
+          },
+          "dmPolicy": "allowlist",
+          "groupAllowFrom": [
+            "${HARNESS_TG_CHAT_ID}"
+          ],
+          "groupPolicy": "allowlist"
+        },
+        "default": {
+          "dmPolicy": "pairing",
+          "groupPolicy": "allowlist"
+        }
+      },
+      "enabled": true,
+      "defaultAccount": "main",
+      "textChunkLimit": 3000,
+      "dmPolicy": "allowlist",
+      "groupPolicy": "allowlist"
+    }
+  },
+  "gateway": {
+    "port": 18789,
+    "mode": "local",
+    "bind": "loopback",
+    "auth": {
+      "mode": "token",
+      "token": {
+        "source": "file",
+        "provider": "local",
+        "id": "/GATEWAY_AUTH_TOKEN"
+      },
+      "allowTailscale": true
+    },
+    "tailscale": {
+      "mode": "off",
+      "resetOnExit": false
+    },
+    "nodes": {},
+    "controlUi": {
+      "allowInsecureAuth": false
+    }
+  },
+  "memory": {
+    "backend": "qmd",
+    "citations": "auto",
+    "qmd": {
+      "includeDefaultMemory": true,
+      "update": {
+        "interval": "1h",
+        "debounceMs": 60000,
+        "onBoot": false,
+        "waitForBootSync": false
+      },
+      "limits": {
+        "maxResults": 5,
+        "timeoutMs": 30000
+      },
+      "scope": {
+        "default": "allow"
+      },
+      "paths": [
+        {
+          "path": "${OPENCLAW_HOME}/workspace",
+          "name": "memory-root",
+          "pattern": "MEMORY.md"
+        }
+      ],
+      "searchMode": "query",
+      "mcporter": {
+        "enabled": true,
+        "startDaemon": true
+      },
+      "sessions": {
+        "enabled": false
+      }
+    }
+  },
+  "skills": {
+    "install": {
+      "nodeManager": "npm"
+    },
+    "entries": {}
+  },
+  "messages": {
+    "ackReactionScope": "group-mentions",
+    "groupChat": {
+      "visibleReplies": "message_tool"
+    }
+  },
+  "plugins": {
+    "allow": [
+      "acpx",
+      "active-memory",
+      "anthropic",
+      "brave",
+      "browser",
+      "codex",
+      "device-pair",
+      "diffs",
+      "duckduckgo",
+      "google",
+      "memory-core",
+      "ollama",
+      "openai",
+      "tavily",
+      "telegram",
+      "tokenjuice"
+    ],
+    "slots": {
+      "memory": "memory-core"
+    },
+    "entries": {
+      "anthropic": {
+        "enabled": true
+      },
+      "browser": {
+        "enabled": true
+      },
+      "duckduckgo": {
+        "enabled": true
+      },
+      "google": {
+        "enabled": true
+      },
+      "memory-core": {
+        "config": {
+          "dreaming": {
+            "enabled": true
+          }
+        },
+        "enabled": true
+      },
+      "active-memory": {
+        "enabled": true,
+        "config": {
+          "agents": [
+            "main",
+            "dev"
+          ],
+          "allowedChatTypes": [
+            "direct"
+          ],
+          "queryMode": "recent",
+          "promptStyle": "balanced",
+          "timeoutMs": 15000,
+          "setupGraceTimeoutMs": 30000,
+          "maxSummaryChars": 500
+        }
+      },
+      "ollama": {
+        "enabled": true,
+        "config": {
+          "discovery": {
+            "enabled": true
+          }
+        }
+      },
+      "telegram": {
+        "enabled": true
+      },
+      "tavily": {
+        "enabled": true
+      },
+      "device-pair": {
+        "enabled": true
+      },
+      "openai": {
+        "enabled": true
+      },
+      "codex": {
+        "enabled": true
+      },
+      "acpx": {
+        "enabled": true
+      },
+      "brave": {
+        "enabled": true
+      },
+      "tokenjuice": {
+        "enabled": true
+      },
+      "diffs": {
+        "enabled": true
+      }
+    },
+    "enabled": true,
+    "bundledDiscovery": "allowlist"
+  },
+  "cron": {
+    "enabled": true,
+    "failureAlert": {
+      "enabled": true
+    },
+    "failureDestination": {
+      "channel": "telegram",
+      "to": "${HARNESS_TG_CHAT_ID}",
+      "accountId": "main",
+      "mode": "announce"
+    }
+  },
+  "approvals": {
+    "exec": {
+      "enabled": true
+    }
+  },
+  "update": {
+    "auto": {
+      "enabled": true
+    },
+    "channel": "stable",
+    "checkOnStart": true
+  },
+  "mcp": {
+    "servers": {
+      "github": {
+        "command": "${OPENCLAW_HOME}/.local/bin/github-mcp-server",
+        "args": [
+          "stdio"
+        ],
+        "env": {
+          "GITHUB_PERSONAL_ACCESS_TOKEN": "<REDACTED_GITHUB_PERSONAL_ACCESS_TOKEN>"
+        }
+      },
+      "gbrain": {
+        "url": "http://localhost:8182/mcp",
+        "transport": "streamable-http",
+        "headers": {
+          "Authorization": "Bearer ${GBRAIN_TOKEN_MAIN}"
+        },
+        "connectionTimeoutMs": 30000
+      },
+      "qmd": {
+        "url": "http://[::1]:8181/mcp",
+        "transport": "streamable-http",
+        "connectionTimeoutMs": 30000
+      }
+    }
+  },
+  "acp": {
+    "enabled": true,
+    "backend": "acpx",
+    "defaultAgent": "claude",
+    "allowedAgents": [
+      "claude",
+      "gemini",
+      "codex",
+      "cursor"
+    ],
+    "maxConcurrentSessions": 4
+  },
+  "diagnostics": {
+    "enabled": true,
+    "otel": {
+      "enabled": false,
+      "traces": true,
+      "metrics": true,
+      "sampleRate": 0,
+      "captureContent": false,
+      "serviceName": "agent-harness",
+      "endpoint": "http://localhost:4318"
+    }
+  },
+  "secrets": {
+    "providers": {
+      "local": {
+        "source": "file",
+        "path": "${OPENCLAW_HOME}/secrets.json",
+        "mode": "json"
+      },
+      "env": {
+        "source": "env",
+        "allowlist": [
+          "ANTHROPIC_API_KEY",
+          "GEMINI_API_KEY",
+          "TAVILY_API_KEY",
+          "BRAVE_API_KEY",
+          "OLLAMA_API_KEY",
+          "GBRAIN_TOKEN_MAIN",
+          "GBRAIN_TOKEN_DEV"
+        ]
+      }
+    }
+  },
+  "commitments": {
+    "enabled": true,
+    "maxPerDay": 2
+  }
+}

@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+# cron-wrapper-audit — enforce the cron-thin-trigger-skill-does-work invariant.
+#
+# Walks every ai.{openclaw,gbrain}.*.plist and verifies its ProgramArguments
+# either starts with skill-wrapper OR the plist label is in the documented
+# exception allow-list. Violations get a Drift incident; clean runs are silent.
+#
+# Backs the rule in wiki/agent-behaviors/cron-thin-trigger-skill-does-work.md.
+#
+# Exit codes (Unix convention):
+#   0  — clean, all plists compliant
+#   1  — at least one violation found (incident emitted)
+#   2  — script-level error (missing dependencies, unreadable plists)
+#
+set -u
+set -o pipefail
+
+OPENCLAW_HOME="${OPENCLAW_HOME:-$HOME/.openclaw}"
+LAUNCHAGENTS="${LAUNCHAGENTS:-$HOME/Library/LaunchAgents}"
+PLIST_GLOB="ai.openclaw.*.plist ai.gbrain.*.plist"
+VERBOSE=0
+EMIT_INCIDENT=0
+DRY_RUN=0
+
+# Resolve the orchestrator agent id from config/agents.map (first row), used as
+# the --agent owner of emitted incidents. Defaults to "main" if no map present.
+AGENTS_MAP_FILE="${AGENTS_MAP:-}"
+if [ -z "$AGENTS_MAP_FILE" ] || [ ! -f "$AGENTS_MAP_FILE" ]; then
+  if [ -f "$OPENCLAW_HOME/config/agents.map" ]; then
+    AGENTS_MAP_FILE="$OPENCLAW_HOME/config/agents.map"
+  else
+    _self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    AGENTS_MAP_FILE="$_self_dir/../../config/agents.map"
+  fi
+fi
+INCIDENT_AGENT="main"
+if [ -f "$AGENTS_MAP_FILE" ]; then
+  _first_agent="$(grep -vE '^\s*#' "$AGENTS_MAP_FILE" | awk 'NF>=3 {print $1; exit}')"
+  [ -n "$_first_agent" ] && INCIDENT_AGENT="$_first_agent"
+fi
+
+# Documented exceptions — plist labels (without .plist suffix) that intentionally
+# bypass skill-wrapper. Each one must have a justification in
+# wiki/agent-behaviors/cron-thin-trigger-skill-does-work.md under "Documented exceptions".
+EXCEPTIONS=(
+  "ai.openclaw.gateway"             # long-running daemon
+  "ai.openclaw.skill-run-archive"   # ledger maintainer (self-reference)
+  "ai.openclaw.skill-run-reap"      # ledger maintainer (self-reference)
+  "ai.gbrain.mcp"                   # long-running daemon
+  "ai.gbrain.postgres-sync"         # gbrain internal observability
+  "ai.gbrain.pg-backup"             # gbrain internal observability
+  "ai.gbrain.golden-eval"           # gbrain internal observability
+  "ai.gbrain.backups-push"          # gbrain internal observability
+  "ai.gbrain.maintenance-daily"     # gbrain internal observability
+)
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --verbose|-v) VERBOSE=1; shift ;;
+    --emit-incident) EMIT_INCIDENT=1; shift ;;
+    --dry-run) DRY_RUN=1; shift ;;
+    -h|--help) sed -n '2,15p' "$0"; exit 0 ;;
+    *) echo "cron-wrapper-audit: unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+log()  { printf '[cron-wrapper-audit] %s\n' "$*"; }
+vlog() { [ "$VERBOSE" -eq 1 ] && printf '[cron-wrapper-audit] %s\n' "$*"; return 0; }
+
+is_exception() {
+  local label="$1"
+  for e in "${EXCEPTIONS[@]}"; do
+    [ "$label" = "$e" ] && return 0
+  done
+  return 1
+}
+
+# plutil handles both XML and binary plists; works for inline single-line layouts too.
+first_program_arg() {
+  /usr/bin/plutil -extract ProgramArguments.0 raw -o - "$1" 2>/dev/null || true
+}
+
+extract_label() {
+  /usr/bin/plutil -extract Label raw -o - "$1" 2>/dev/null || true
+}
+
+violations=()
+compliant=()
+exceptions_found=()
+errors=()
+
+shopt -s nullglob
+for plist in $LAUNCHAGENTS/ai.openclaw.*.plist $LAUNCHAGENTS/ai.gbrain.*.plist; do
+  [ -f "$plist" ] || continue
+  label=$(extract_label "$plist")
+  if [ -z "$label" ]; then
+    errors+=("$(basename "$plist") (no Label found)")
+    continue
+  fi
+  first_arg=$(first_program_arg "$plist")
+  if [ -z "$first_arg" ]; then
+    errors+=("$label (no ProgramArguments[0])")
+    continue
+  fi
+
+  if [[ "$first_arg" == *skill-wrapper* ]]; then
+    compliant+=("$label")
+    vlog "OK   $label (wrapped)"
+  elif is_exception "$label"; then
+    exceptions_found+=("$label")
+    vlog "EXC  $label (documented exception)"
+  else
+    violations+=("$label  first_arg=$first_arg")
+    log "VIOLATION $label — first arg is '$first_arg', not skill-wrapper"
+  fi
+done
+
+log "summary: wrapped=${#compliant[@]} exceptions=${#exceptions_found[@]} violations=${#violations[@]} errors=${#errors[@]}"
+
+if [ ${#errors[@]} -gt 0 ]; then
+  for e in "${errors[@]}"; do
+    log "ERROR: $e"
+  done
+fi
+
+if [ ${#violations[@]} -eq 0 ] && [ ${#errors[@]} -eq 0 ]; then
+  exit 0
+fi
+
+# Emit a single rolled-up Drift incident covering all violations
+if [ ${#violations[@]} -gt 0 ] && [ "$EMIT_INCIDENT" -eq 1 ] && [ "$DRY_RUN" -eq 0 ]; then
+  today=$(date +%F)
+  title="cron-wrapper-audit: ${#violations[@]} plist(s) bypass skill-wrapper"
+  raw=$(mktemp -t cron-wrapper-audit-XXXXXX.md)
+  {
+    echo "# cron-wrapper-audit violation report — $today"
+    echo
+    echo "The following plists in \`~/Library/LaunchAgents/\` do not route through skill-wrapper and are not in the documented exception list:"
+    echo
+    for v in "${violations[@]}"; do
+      echo "- \`$v\`"
+    done
+    echo
+    echo "Rule: \`wiki/agent-behaviors/cron-thin-trigger-skill-does-work.md\`"
+    echo "Fix: wrap ProgramArguments through \`skill-wrapper --skill <name> --agent <agent> --trigger cron -- <original>\`, OR add a justified entry to the documented-exceptions list."
+  } > "$raw"
+
+  "$OPENCLAW_HOME/bin/drift/incident" emit \
+    --source "cron-wrapper-audit" \
+    --type "cron-bypass" \
+    --severity "med" \
+    --title "$title" \
+    --agent "$INCIDENT_AGENT" \
+    --key "cron-wrapper-audit-$today" \
+    --raw-file "$raw" \
+    >/dev/null 2>&1 || log "WARN: incident emit failed (see incident-emit logs)"
+  rm -f "$raw"
+fi
+
+exit 1

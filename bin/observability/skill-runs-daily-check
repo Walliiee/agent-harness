@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Part of agent-harness (https://github.com/${GH_ORG}/agent-harness)
+"""skill-runs-daily-check — terse morning health report on the skill-runs ledger.
+
+Shows:
+  - Today's runs grouped by skill (counts + outcomes)
+  - Anomalies: in_flight orphans, failures, expected-but-missing wired-cron records
+  - Hypothesis cycle status (pending verifications)
+
+Designed to be quick-read after morning crons fire. Exit 0 if healthy, 1 if anomalies present.
+
+Usage:
+  skill-runs-daily-check                  # today (UTC)
+  skill-runs-daily-check --date 2026-05-27
+  skill-runs-daily-check --json           # machine-readable
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+OPENCLAW_HOME = Path(os.environ.get("OPENCLAW_HOME", os.path.expanduser("~/.openclaw")))
+ROOT = Path(os.environ.get("OPENCLAW_SKILL_RUNS_DIR", str(OPENCLAW_HOME / "skill-runs")))
+STATE_FILE = ROOT / "state.json"
+JOBS_PATH = OPENCLAW_HOME / "cron" / "jobs.json"
+
+WRAPPED_MARKERS = ("skill-wrapper", "skill-run start")
+FRONTMATTER_RE = re.compile(r"^---\n(.*?)\n---", re.DOTALL)
+
+
+def _load_agents_map():
+    """Return list of (agent_id, workspace_dir, persona) from config/agents.map."""
+    here = Path(__file__).resolve()
+    candidates = []
+    env_map = os.environ.get("AGENTS_MAP")
+    if env_map:
+        candidates.append(Path(env_map))
+    candidates.append(OPENCLAW_HOME / "config" / "agents.map")
+    candidates.append(here.parent.parent.parent / "config" / "agents.map")
+    for c in candidates:
+        try:
+            if c.is_file():
+                rows = []
+                for line in c.read_text(encoding="utf-8").splitlines():
+                    line = line.split("#", 1)[0].strip()
+                    if not line:
+                        continue
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        rows.append((parts[0], parts[1], parts[2]))
+                if rows:
+                    return rows
+        except OSError:
+            continue
+    return [("main", "workspace", "Orchestrator"), ("dev", "workspace-dev", "Developer")]
+
+
+AGENTS = _load_agents_map()
+# Map a cron job's agentId (the agent-id column) to the agent label used in records.
+AGENT_MAP = {aid: aid for aid, _ws, _p in AGENTS}
+
+
+def parse_fm(text: str) -> dict:
+    m = FRONTMATTER_RE.search(text)
+    if not m:
+        return {}
+    fm: dict = {}
+    for line in m.group(1).split("\n"):
+        if ":" not in line:
+            continue
+        k, _, v = line.partition(":")
+        fm[k.strip()] = v.strip()
+    return fm
+
+
+def load_today_runs(date: str) -> list[dict]:
+    day_dir = ROOT / date
+    if not day_dir.is_dir():
+        return []
+    out = []
+    for f in sorted(day_dir.glob("*.md")):
+        try:
+            fm = parse_fm(f.read_text())
+            if fm:
+                out.append(fm)
+        except OSError:
+            continue
+    return out
+
+
+def load_in_flight() -> dict:
+    if not STATE_FILE.exists():
+        return {}
+    try:
+        return json.loads(STATE_FILE.read_text()).get("in_flight", {})
+    except json.JSONDecodeError:
+        return {}
+
+
+def load_wired_crons() -> list[dict]:
+    """Return cron jobs whose payload is wrapped, with expected agent."""
+    if not JOBS_PATH.exists():
+        return []
+    try:
+        data = json.loads(JOBS_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        return []
+    out = []
+    for j in data.get("jobs", []):
+        agent_id = j.get("agentId")
+        if agent_id not in AGENT_MAP:
+            continue
+        msg = (j.get("payload") or {}).get("message", "")
+        if not any(m in msg for m in WRAPPED_MARKERS):
+            continue
+        out.append({
+            "id": j["id"],
+            "name": j.get("name", j["id"]),
+            "agent": AGENT_MAP[agent_id],
+            "schedule": (j.get("schedule") or {}).get("expr", "?"),
+            "enabled": j.get("enabled", True),
+        })
+    return out
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(prog="skill-runs-daily-check")
+    p.add_argument("--date", default=None, help="YYYY-MM-DD; default = today (UTC)")
+    p.add_argument("--json", action="store_true", help="emit JSON")
+    args = p.parse_args()
+
+    date = args.date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    runs = load_today_runs(date)
+    in_flight = load_in_flight()
+    wired = load_wired_crons()
+
+    # --- analysis ---
+    by_skill: dict[str, dict] = {}
+    failures = []
+    degraded = []
+    successes = []
+    in_flight_today = []
+    for r in runs:
+        skill = r.get("skill", "?")
+        bucket = by_skill.setdefault(skill, {"success": 0, "degraded": 0, "failure": 0, "in_flight": 0})
+        outcome = r.get("outcome", "?")
+        bucket[outcome] = bucket.get(outcome, 0) + 1
+        if outcome == "failure":
+            failures.append(r)
+        elif outcome == "degraded":
+            degraded.append(r)
+        elif outcome == "success":
+            successes.append(r)
+        elif outcome == "in_flight":
+            in_flight_today.append(r)
+
+    # Expected-but-missing: wired crons whose schedule should have fired by now today
+    # (we don't try to be clock-precise — just flag if no record at all today)
+    now = datetime.now(timezone.utc)
+    today_runs_by_agent: dict[str, int] = {}
+    for r in runs:
+        today_runs_by_agent[r.get("agent", "?")] = today_runs_by_agent.get(r.get("agent", "?"), 0) + 1
+
+    missing_wired = []
+    for w in wired:
+        if not w["enabled"]:
+            continue
+        # Cron fires at certain hour. We don't parse the cron expr deeply here; just flag
+        # if NO record exists today for this skill+agent combo.
+        skill_runs_for_agent = [r for r in runs if r.get("agent") == w["agent"]]
+        # Heuristic: if it's after 23:59 local and no record for this wired cron, that's odd.
+        # For the morning check, only flag if hour > schedule hour AND no record.
+        try:
+            sched_hour = int((w["schedule"].split()[1] or "0"))
+        except (ValueError, IndexError):
+            sched_hour = None
+        if sched_hour is not None and now.hour > sched_hour + 1 and not skill_runs_for_agent:
+            missing_wired.append(w)
+
+    # Hypothesis verifications pending
+    pending_verifications = [r for r in runs if r.get("verify_status") == "pending"]
+
+    # --- output ---
+    if args.json:
+        out = {
+            "date": date,
+            "total_runs": len(runs),
+            "by_skill": by_skill,
+            "failures": [r.get("run_id") for r in failures],
+            "degraded": [r.get("run_id") for r in degraded],
+            "in_flight_today": [r.get("run_id") for r in in_flight_today],
+            "in_flight_global": list(in_flight.keys()),
+            "missing_wired": [w["name"] for w in missing_wired],
+            "pending_verifications": [r.get("run_id") for r in pending_verifications],
+        }
+        print(json.dumps(out, indent=2))
+        return 1 if (failures or missing_wired or in_flight_global_orphans(in_flight, date)) else 0
+
+    # Terse human output
+    print(f"=== skill-runs daily check — {date} ===")
+    print(f"records today: {len(runs)}  (success: {len(successes)}, degraded: {len(degraded)}, failure: {len(failures)}, in_flight: {len(in_flight_today)})")
+    print()
+
+    if by_skill:
+        print("by skill:")
+        for skill in sorted(by_skill):
+            b = by_skill[skill]
+            parts = [f"{k}={v}" for k, v in b.items() if v > 0]
+            print(f"  {skill:<40} {' '.join(parts)}")
+        print()
+
+    if failures:
+        print(f"⚠ FAILURES ({len(failures)}):")
+        for r in failures:
+            print(f"  - {r.get('skill')} ({r.get('agent')}) — run_id: {r.get('run_id')}")
+        print()
+
+    if degraded:
+        print(f"~ DEGRADED ({len(degraded)}):")
+        for r in degraded:
+            print(f"  - {r.get('skill')} ({r.get('agent')}) — run_id: {r.get('run_id')}")
+        print()
+
+    orphans = in_flight_global_orphans(in_flight, date)
+    if orphans:
+        print(f"⚠ IN-FLIGHT ORPHANS (will be reaped next hour): {len(orphans)}")
+        for run_id, info in orphans.items():
+            print(f"  - {info.get('skill')} ({info.get('agent')}) — started: {info.get('started_at')}")
+        print()
+
+    if missing_wired:
+        print(f"⚠ WIRED CRONS THAT SHOULD HAVE FIRED — no record today:")
+        for w in missing_wired:
+            print(f"  - {w['name']} ({w['agent']}, schedule: {w['schedule']})")
+        print()
+
+    if pending_verifications:
+        print(f"⏳ Hypothesis verifications pending ({len(pending_verifications)}):")
+        for r in pending_verifications:
+            print(f"  - {r.get('skill')} — hypothesis_ref: {r.get('hypothesis_ref', '?')[:12]}…")
+        print()
+
+    if not (failures or orphans or missing_wired):
+        print("✓ healthy")
+        return 0
+    return 1
+
+
+def in_flight_global_orphans(in_flight: dict, date: str) -> dict:
+    """Returns in_flight entries that started today but didn't end."""
+    out = {}
+    for run_id, info in in_flight.items():
+        if (info.get("started_at") or "").startswith(date):
+            out[run_id] = info
+    return out
+
+
+if __name__ == "__main__":
+    sys.exit(main())

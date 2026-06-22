@@ -1,0 +1,223 @@
+#!/usr/bin/env python3
+"""One-shot migration: rewrite incident frontmatter from legacy nested YAML to inline-JSON format.
+
+Walks every incident file, extracts top-level fields by line-based scan, then re-dumps using the
+new dump_yaml format (nested dicts/lists inlined as JSON). The Analysis JSON block in the body
+is left untouched.
+
+Idempotent — safe to run twice.
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+ROOT = Path(os.environ.get("OPENCLAW_INCIDENTS_DIR", str(Path.home() / ".openclaw" / "incidents")))
+FRONTMATTER_RE = re.compile(r"^---\n(.*?)\n---\n(.*)$", re.DOTALL)
+
+# Top-level keys we expect in the new schema. Anything else gets dropped.
+KEEP_KEYS = {
+    "id", "dedup_key", "source", "type", "detected_at", "status", "severity",
+    "title", "agent", "run_id", "related", "fields", "proposed_fix", "confidence",
+    "blast_radius", "applied_at", "applied_by", "recurrence_of",
+    "analyzed_at", "analyzer_model",
+}
+
+# Fields that must be present on every record. Missing → set to default (idempotent backfill).
+DEFAULT_VALUES = {
+    "run_id": None,
+}
+
+
+def dump_yaml(d: dict) -> str:
+    lines = []
+    for k, v in d.items():
+        if v is None:
+            lines.append(f"{k}: null")
+        elif isinstance(v, bool):
+            lines.append(f"{k}: {'true' if v else 'false'}")
+        elif isinstance(v, (int, float)):
+            lines.append(f"{k}: {v}")
+        elif isinstance(v, str):
+            if v == "" or any(c in v for c in ":#\n\"'") or v.strip() != v:
+                lines.append(f"{k}: {json.dumps(v)}")
+            else:
+                lines.append(f"{k}: {v}")
+        elif isinstance(v, (dict, list)):
+            lines.append(f"{k}: {json.dumps(v, ensure_ascii=False)}")
+        else:
+            lines.append(f"{k}: {json.dumps(str(v))}")
+    return "\n".join(lines)
+
+
+def extract_legacy_fm(fm_text: str) -> dict:
+    """Tolerant frontmatter parser. Top-level keys only; nested blocks parsed as a single JSON value if possible, else dropped."""
+    out: dict = {}
+    lines = fm_text.split("\n")
+    i = 0
+    while i < len(lines):
+        raw = lines[i]
+        if not raw.strip():
+            i += 1
+            continue
+        if raw.startswith(" ") or raw.startswith("-"):
+            i += 1
+            continue
+        if ":" not in raw:
+            i += 1
+            continue
+        k, _, v = raw.partition(":")
+        k = k.strip()
+        v = v.strip()
+        if v == "":
+            # Nested block. Collect subsequent indented lines.
+            nested = []
+            i += 1
+            while i < len(lines) and (lines[i].startswith(" ") or lines[i].startswith("-")):
+                nested.append(lines[i])
+                i += 1
+            # Try to interpret nested as a dict
+            d = parse_nested(nested)
+            out[k] = d
+            continue
+        else:
+            # Scalar
+            if v.startswith('"') and v.endswith('"'):
+                try:
+                    out[k] = json.loads(v)
+                except Exception:
+                    out[k] = v[1:-1]
+            elif v.startswith("{") or v.startswith("["):
+                try:
+                    out[k] = json.loads(v)
+                except Exception:
+                    out[k] = v
+            elif v in ("null", "~"):
+                out[k] = None
+            elif v == "true":
+                out[k] = True
+            elif v == "false":
+                out[k] = False
+            else:
+                try:
+                    out[k] = int(v)
+                except ValueError:
+                    try:
+                        out[k] = float(v)
+                    except ValueError:
+                        out[k] = v
+            i += 1
+    return out
+
+
+DICT_ITEM_RE = re.compile(r"^\s*-\s+[a-zA-Z_][a-zA-Z0-9_]*\s*:\s+\S")
+
+
+def parse_nested(lines: list[str]) -> dict | list:
+    """Parse a block of indented YAML lines into a dict, list of scalars, or list of dicts."""
+    if not lines:
+        return {}
+    dashed = [l for l in lines if re.match(r"\s*-\s+", l)]
+    if dashed:
+        # List-of-dicts only if EVERY dashed item starts with `- <simple_key>: <value>`.
+        # Otherwise treat as list of scalars (paths, plain strings, etc.).
+        if all(DICT_ITEM_RE.match(l) for l in dashed):
+            items: list = []
+            current: dict | None = None
+            for l in lines:
+                if re.match(r"\s*-\s+", l):
+                    if current is not None:
+                        items.append(current)
+                    current = {}
+                    stripped = re.sub(r"^\s*-\s+", "", l)
+                    if ":" in stripped:
+                        k, _, v = stripped.partition(":")
+                        current[k.strip()] = _scalar(v.strip())
+                elif current is not None and ":" in l:
+                    k, _, v = l.partition(":")
+                    current[k.strip()] = _scalar(v.strip())
+            if current is not None:
+                items.append(current)
+            return items
+        # Scalar list.
+        return [_scalar(re.sub(r"^\s*-\s+", "", l).strip()) for l in dashed]
+    # Otherwise treat as flat dict
+    d: dict = {}
+    for l in lines:
+        if ":" in l:
+            k, _, v = l.partition(":")
+            d[k.strip()] = _scalar(v.strip())
+    return d
+
+
+def _scalar(v: str):
+    if v == "" or v == "null" or v == "~":
+        return None
+    if v == "true":
+        return True
+    if v == "false":
+        return False
+    if v.startswith('"') and v.endswith('"'):
+        try:
+            return json.loads(v)
+        except Exception:
+            return v[1:-1]
+    if v.startswith("{") or v.startswith("["):
+        try:
+            return json.loads(v)
+        except Exception:
+            return v
+    try:
+        return int(v)
+    except ValueError:
+        pass
+    try:
+        return float(v)
+    except ValueError:
+        pass
+    return v
+
+
+def migrate_one(path: Path, dry_run: bool = False) -> str:
+    text = path.read_text()
+    m = FRONTMATTER_RE.match(text)
+    if not m:
+        return "no-frontmatter"
+    fm_text, body = m.group(1), m.group(2)
+    fm = extract_legacy_fm(fm_text)
+    fm = {k: v for k, v in fm.items() if k in KEEP_KEYS}
+    # Backfill any missing fields with their defaults (idempotent).
+    for k, default in DEFAULT_VALUES.items():
+        fm.setdefault(k, default)
+    new_text = f"---\n{dump_yaml(fm)}\n---\n{body}"
+    if new_text == text:
+        return "unchanged"
+    if dry_run:
+        return "would-change"
+    path.write_text(new_text)
+    return "migrated"
+
+
+def main() -> int:
+    dry = "--dry-run" in sys.argv
+    counts: dict[str, int] = {}
+    for day in sorted(ROOT.iterdir()):
+        if not day.is_dir() or not re.match(r"\d{4}-\d{2}-\d{2}", day.name):
+            continue
+        for f in sorted(day.glob("*.md")):
+            try:
+                result = migrate_one(f, dry_run=dry)
+            except Exception as e:
+                result = f"ERR: {e}"
+            counts[result] = counts.get(result, 0) + 1
+            if result.startswith("ERR") or dry and result == "would-change":
+                print(f"  {result}: {f.name}")
+    print(counts)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

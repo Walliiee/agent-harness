@@ -1,0 +1,268 @@
+#!/usr/bin/env python3
+"""drift-ack — record a Drift topic decision against an incident.
+
+Phase 3a: captures the decision only (no execution). Phase 3b will add apply.
+
+Usage:
+  drift-ack A                                 # apply to the most-recent proposed incident
+  drift-ack A --reply-to-msg-id 1697          # match incident by notify_msg_id
+  drift-ack A --incident-id <full-or-suffix>  # match by incident id
+  drift-ack edit "use --thinking medium"      # custom edit; recorded but not executed
+  drift-ack no                                # reject the proposal
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+ROOT = Path(os.environ.get("OPENCLAW_INCIDENTS_DIR", str(Path.home() / ".openclaw" / "incidents")))
+OPENCLAW = os.environ.get("OPENCLAW_BIN", "openclaw")
+# Telegram routing — read from env, EMPTY by default. When HARNESS_TG_CHAT_ID is
+# unset the Drift ack becomes a no-op (see post_drift()).
+#   HARNESS_TG_CHAT_ID        — target chat/group id for the ops group
+#   HARNESS_TG_DRIFT_TOPIC_ID — topic (thread) id for the Drift topic
+DRIFT_CHAT = os.environ.get("HARNESS_TG_CHAT_ID", "")
+DRIFT_THREAD = os.environ.get("HARNESS_TG_DRIFT_TOPIC_ID", "")
+DRIFT_ACCOUNT = os.environ.get("DRIFT_ACCOUNT", "main")
+
+FRONTMATTER_RE = re.compile(r"^---\n(.*?)\n---\n(.*)$", re.DOTALL)
+CHOICE_RE = re.compile(r"^[A-Za-z]$|^no$|^edit$", re.IGNORECASE)
+
+OPENCLAW_HOME = Path(os.environ.get("OPENCLAW_HOME", os.path.expanduser("~/.openclaw")))
+# skill-run lives in the observability cluster; override via SKILL_RUN_CLI.
+SKILL_RUN_CLI = os.environ.get("SKILL_RUN_CLI", str(OPENCLAW_HOME / "bin" / "observability" / "skill-run"))
+
+
+def maybe_start_skill_run() -> str | None:
+    """Self-instrument the skill-runs ledger UNLESS a parent already wrapped us.
+
+    The SKILL.md autonomous-loop path goes through `skill-wrapper`, which sets
+    `OPENCLAW_RUN_ID` in env. We respect that and skip self-start so we don't
+    double-count. The "orchestrator calls bin/drift-ack inline" path has no
+    wrapper — self-start so it shows up in the ledger as a top-level run.
+
+    Best-effort: skill-run CLI failures don't break the ack.
+    """
+    if os.environ.get("OPENCLAW_RUN_ID"):
+        return None
+    if not Path(SKILL_RUN_CLI).exists():
+        return None
+    try:
+        p = subprocess.run(
+            [SKILL_RUN_CLI, "start",
+             "--skill", "drift-ack",
+             # The orchestrator agent id; override via DRIFT_ACK_AGENT.
+             "--agent", os.environ.get("DRIFT_ACK_AGENT", "main"),
+             "--trigger", "interactive"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if p.returncode == 0:
+            run_id = p.stdout.strip()
+            return run_id or None
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+    return None
+
+
+def maybe_end_skill_run(run_id: str | None, outcome: str, exit_code: int) -> None:
+    if not run_id:
+        return
+    try:
+        subprocess.run(
+            [SKILL_RUN_CLI, "end", run_id,
+             "--outcome", outcome,
+             "--task-completion", "true" if outcome == "success" else "false",
+             "--exit-code", str(exit_code)],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+
+
+def iter_incidents():
+    if not ROOT.exists():
+        return
+    for day in sorted(ROOT.iterdir()):
+        if not day.is_dir() or not re.match(r"\d{4}-\d{2}-\d{2}", day.name):
+            continue
+        for f in sorted(day.glob("*.md")):
+            yield f
+
+
+def read_fm(path: Path) -> dict:
+    text = path.read_text()
+    m = FRONTMATTER_RE.match(text)
+    if not m:
+        return {}
+    out = {}
+    for line in m.group(1).split("\n"):
+        if ":" not in line or line.startswith(" "):
+            continue
+        k, _, v = line.partition(":")
+        v = v.strip()
+        if v.startswith('"') and v.endswith('"'):
+            try:
+                v = json.loads(v)
+            except Exception:
+                v = v[1:-1]
+        out[k.strip()] = v
+    return out
+
+
+def find_incident(args) -> tuple[Path | None, str | None]:
+    """Return (path, error). If error is non-None, caller should surface it loudly."""
+    # 1) Exact reply-to match
+    if args.reply_to_msg_id:
+        for f in iter_incidents():
+            fm = read_fm(f)
+            if str(fm.get("notify_msg_id", "")) == str(args.reply_to_msg_id):
+                return f, None
+        return None, f"no incident matches notify_msg_id={args.reply_to_msg_id}"
+
+    # 2) Explicit id match
+    if args.incident_id:
+        for f in iter_incidents():
+            fm = read_fm(f)
+            inc_id = fm.get("id", "")
+            if inc_id == args.incident_id or inc_id.endswith(args.incident_id):
+                return f, None
+        return None, f"not found: {args.incident_id}"
+
+    # 3) Fallback: latest proposed — refuse if ambiguous.
+    proposed: list[tuple[str, Path]] = []
+    for f in iter_incidents():
+        fm = read_fm(f)
+        if fm.get("status") == "proposed":
+            proposed.append((str(fm.get("detected_at", "")), f))
+    if not proposed:
+        return None, "no proposed incidents — reply to a specific Drift notification (long-press → Reply)"
+    if len(proposed) > 1 and not args.allow_latest:
+        ids = ", ".join(read_fm(p).get("id", "?")[-12:] for _, p in sorted(proposed, reverse=True)[:5])
+        return None, f"{len(proposed)} proposed incidents — reply to the specific Drift card (long-press → Reply). Recent: {ids}"
+    proposed.sort(reverse=True)
+    return proposed[0][1], None
+
+
+def post_drift(text: str) -> None:
+    if not DRIFT_CHAT:
+        print(f"drift-ack skip (HARNESS_TG_CHAT_ID unset): {text}", file=sys.stderr)
+        return
+    cmd = [
+        OPENCLAW, "message", "send",
+        "--channel", "telegram",
+        "--account", DRIFT_ACCOUNT,
+        "--target", DRIFT_CHAT,
+        "--thread-id", DRIFT_THREAD,
+        "--message", text,
+    ]
+    p = subprocess.run(cmd, capture_output=True, text=True)
+    if p.returncode != 0:
+        print(f"WARN: post failed: {p.stderr}", file=sys.stderr)
+
+
+def main():
+    p = argparse.ArgumentParser(prog="drift-ack")
+    p.add_argument("choice", help="A|B|C|no|edit (case-insensitive)")
+    p.add_argument("note", nargs="?", default="", help="optional edit text or comment")
+    p.add_argument("--reply-to-msg-id", default=None)
+    p.add_argument("--incident-id", default=None)
+    p.add_argument("--allow-latest", action="store_true", help="allow picking the single latest proposed incident when no reply-to or id given")
+    p.add_argument("--no-post", action="store_true", help="skip posting the ack to Drift")
+    args = p.parse_args()
+
+    run_id = maybe_start_skill_run()
+
+    raw_choice = args.choice.strip()
+    if not CHOICE_RE.match(raw_choice):
+        print(f"invalid choice: {raw_choice!r} (expected A|B|C|no|edit)", file=sys.stderr)
+        maybe_end_skill_run(run_id, "failure", 2)
+        return 2
+    choice = raw_choice.upper() if raw_choice.lower() not in ("no", "edit") else raw_choice.lower()
+
+    path, err = find_incident(args)
+    if not path:
+        msg = err or "no matching incident found"
+        print(msg, file=sys.stderr)
+        if not args.no_post:
+            post_drift(f"⚠️ drift-ack {raw_choice}: {msg}")
+        maybe_end_skill_run(run_id, "failure", 1)
+        return 1
+
+    fm = read_fm(path)
+    inc_id = fm.get("id", "?")
+
+    if fm.get("status") != "proposed":
+        print(f"WARN: incident {inc_id} is status={fm.get('status')!r}, not 'proposed'", file=sys.stderr)
+
+    # Read the proposal to validate the choice and pick the corresponding option
+    text = path.read_text()
+    proposal_match = re.search(r"## Analysis\n\n```json\n(\{.*?\})\n```", text, re.DOTALL)
+    proposal = json.loads(proposal_match.group(1)) if proposal_match else {}
+    options = proposal.get("options", [])
+    chosen_opt = None
+    if choice in ("A", "B", "C"):
+        chosen_opt = next((o for o in options if o.get("label") == choice), None)
+        if not chosen_opt:
+            print(f"WARN: option {choice!r} not in proposal", file=sys.stderr)
+
+    # Compute new status
+    if choice == "no":
+        new_status = "rejected"
+    elif choice == "edit":
+        new_status = "edit-requested"
+    else:
+        new_status = f"approved-{choice}"
+
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    decided_block = f"""## Decision
+
+```
+{json.dumps({
+    "choice": choice,
+    "note": args.note,
+    "decided_at": now,
+    "via": "reply-to" if args.reply_to_msg_id else ("id" if args.incident_id else "latest"),
+    "chosen_option": chosen_opt,
+    "new_status": new_status,
+}, indent=2)}
+```
+"""
+    if "## Decision" in text:
+        text = re.sub(r"## Decision\n.*?(?=\n## |\Z)", lambda _m: decided_block.rstrip("\n"), text, count=1, flags=re.DOTALL)
+    else:
+        text = text.rstrip() + "\n\n" + decided_block
+
+    # Patch status in frontmatter
+    text = re.sub(r"^status:\s*\S+", f"status: {new_status}", text, count=1, flags=re.MULTILINE)
+    # Add decided_at + decided_choice if not present
+    for key, val in (("decided_at", now), ("decided_choice", choice)):
+        if f"{key}:" in text:
+            text = re.sub(rf"^{key}:.*$", f"{key}: {val}", text, count=1, flags=re.MULTILINE)
+        else:
+            text = re.sub(r"\n---\n", f"\n{key}: {val}\n---\n", text, count=1)
+    path.write_text(text)
+
+    short_id = inc_id[-22:]
+    if not args.no_post:
+        if choice in ("A", "B", "C"):
+            summary = (chosen_opt or {}).get("summary", "(no summary)")
+            ack = f"✓ Got {choice} — queued for apply\n→ {summary[:200]}\nid …{short_id}"
+        elif choice == "no":
+            ack = f"✗ Rejected — incident closed as wontfix\nid …{short_id}"
+        else:
+            ack = f"✏️ Edit requested — {args.note[:200] if args.note else '(no note)'}\nid …{short_id}"
+        post_drift(ack)
+
+    print(f"ok: {inc_id} → {new_status}")
+    maybe_end_skill_run(run_id, "success", 0)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,153 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Part of agent-harness (https://github.com/${GH_ORG}/agent-harness)
+"""skill-run-archive — bundle skill-runs/YYYY-MM-DD/ older than 90 days into archive/YYYY-MM.tar.gz.
+
+Idempotent: re-running merges any newly-eligible days into the existing month tarball.
+Safe: tar is built atomically, original dirs only removed after successful archive write + verify.
+
+Usage:
+  skill-run-archive [--dry-run] [--retention-days N] [--ledger-dir PATH]
+
+Defaults:
+  retention-days = 90
+  ledger-dir = ${OPENCLAW_HOME}/skill-runs
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import shutil
+import sys
+import tarfile
+import tempfile
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+OPENCLAW_HOME = Path(os.environ.get("OPENCLAW_HOME", os.path.expanduser("~/.openclaw")))
+
+DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def parse_day(s: str) -> datetime | None:
+    try:
+        return datetime.strptime(s, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def eligible_days(ledger: Path, cutoff: datetime) -> list[Path]:
+    out: list[Path] = []
+    for d in sorted(ledger.iterdir()):
+        if not d.is_dir():
+            continue
+        if not DAY_RE.match(d.name):
+            continue
+        day = parse_day(d.name)
+        if day is None:
+            continue
+        if day < cutoff:
+            out.append(d)
+    return out
+
+
+def group_by_month(days: list[Path]) -> dict[str, list[Path]]:
+    groups: dict[str, list[Path]] = {}
+    for d in days:
+        month = d.name[:7]  # YYYY-MM
+        groups.setdefault(month, []).append(d)
+    return groups
+
+
+def archive_month(month: str, day_dirs: list[Path], archive_dir: Path, dry_run: bool) -> tuple[bool, str]:
+    """Bundle day_dirs into archive_dir/{month}.tar.gz. Merges with existing tarball if present."""
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    target = archive_dir / f"{month}.tar.gz"
+
+    if dry_run:
+        return True, f"[dry-run] would archive {len(day_dirs)} day(s) into {target.name}"
+
+    # If an existing tarball exists, extract its contents into a staging area first,
+    # then re-tar everything (existing + new days). This keeps the archive merged
+    # without partial-write risk.
+    staging = Path(tempfile.mkdtemp(prefix=f".skill-run-archive-{month}-", dir=str(archive_dir.parent)))
+    try:
+        # Extract existing tarball (if any) into staging
+        if target.exists():
+            with tarfile.open(target, "r:gz") as tf:
+                tf.extractall(staging)
+
+        # Copy new day_dirs into staging
+        for d in day_dirs:
+            dest = staging / d.name
+            if dest.exists():
+                # Day already in archive — merge file-by-file (new wins)
+                for f in d.iterdir():
+                    shutil.copy2(f, dest / f.name)
+            else:
+                shutil.copytree(d, dest)
+
+        # Write new tarball atomically: write to .tmp then replace
+        tmp_target = target.with_suffix(".tar.gz.tmp")
+        with tarfile.open(tmp_target, "w:gz") as tf:
+            for entry in sorted(staging.iterdir()):
+                tf.add(entry, arcname=entry.name)
+
+        # Verify the new tarball
+        try:
+            with tarfile.open(tmp_target, "r:gz") as tf:
+                # Just walk all entries to confirm integrity
+                names = tf.getnames()
+                if not names:
+                    raise ValueError("empty tarball after archive")
+        except Exception as e:
+            tmp_target.unlink(missing_ok=True)
+            return False, f"verify failed for {month}: {e}"
+
+        os.replace(tmp_target, target)
+
+        # Now safe to remove originals
+        for d in day_dirs:
+            shutil.rmtree(d)
+
+        return True, f"archived {len(day_dirs)} day(s) into {target.name}"
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description="archive skill-runs days older than retention")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--retention-days", type=int, default=90)
+    p.add_argument("--ledger-dir", default=str(OPENCLAW_HOME / "skill-runs"))
+    args = p.parse_args()
+
+    ledger = Path(args.ledger_dir)
+    if not ledger.is_dir():
+        print(f"skill-run-archive: ledger dir not found: {ledger}", file=sys.stderr)
+        return 1
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=args.retention_days)
+    days = eligible_days(ledger, cutoff)
+
+    if not days:
+        print(f"skill-run-archive: nothing to archive (cutoff {cutoff.strftime('%Y-%m-%d')})")
+        return 0
+
+    archive_dir = ledger / "archive"
+    groups = group_by_month(days)
+
+    failures = 0
+    for month, ds in sorted(groups.items()):
+        ok, msg = archive_month(month, ds, archive_dir, args.dry_run)
+        print(f"{month}: {msg}")
+        if not ok:
+            failures += 1
+
+    return 0 if failures == 0 else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

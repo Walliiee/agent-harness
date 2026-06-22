@@ -1,0 +1,88 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Part of agent-harness (https://github.com/${GH_ORG}/agent-harness)
+"""Harvest per-run model reliability data from the gateway's cron_run_logs into the
+durable interaction log. DETERMINISTIC — reads the runtime's own authoritative records,
+never agent self-reporting (an agent often doesn't even know it fell back).
+
+Why harvest instead of querying cron_run_logs directly: that table is pruned
+(cron.runLog retention), but state/interaction-log.jsonl is append-only — so this builds
+a PERMANENT per-model reliability dataset that survives pruning and drives fallback-chain
+ordering on evidence. Incremental + idempotent via a created_at watermark.
+
+Run as a daily command-cron. See reference/interaction-log.md / model-metadata schema.
+"""
+import sqlite3, json, os, sys, fcntl
+from datetime import datetime, timezone
+
+OPENCLAW_HOME = os.environ.get("OPENCLAW_HOME", os.path.expanduser("~/.openclaw"))
+DB  = os.path.join(OPENCLAW_HOME, "state", "openclaw.sqlite")
+LOG = os.path.join(OPENCLAW_HOME, "state", "interaction-log.jsonl")
+WM  = os.path.join(OPENCLAW_HOME, "state", "model-stats-watermark")
+
+
+def load_jobs(con):
+    jobs = {}
+    for jid, name, agent, model, kind in con.execute(
+            "SELECT job_id, name, agent_id, payload_model, payload_kind FROM cron_jobs"):
+        jobs[jid] = {
+            "name": name or jid[:8],
+            "agent": agent or "-",
+            "primary": model or "",
+            "kind": kind or "agent",
+        }
+    return jobs
+
+
+def main():
+    wm = 0
+    if os.path.exists(WM):
+        try:
+            wm = int(open(WM).read().strip() or 0)
+        except Exception:
+            wm = 0
+    con = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+    jobs = load_jobs(con)
+    rows = con.execute(
+        "SELECT job_id,status,model,provider,duration_ms,total_tokens,run_at_ms,run_id,created_at,error "
+        "FROM cron_run_logs WHERE created_at > ? ORDER BY created_at", (wm,)).fetchall()
+    out, maxc = [], wm
+    for jid, status, model, provider, dur, tok, run_at, run_id, created, err in rows:
+        maxc = max(maxc, created or 0)
+        j = jobs.get(jid, {"name": jid[:8], "agent": "-", "primary": "", "kind": "agent"})
+        if j["kind"] == "command":          # command crons don't use a model
+            continue
+        actual = f"{provider}/{model}" if provider and model else (model or "")
+        primary = j["primary"]
+        outcome = {"ok": "success", "skipped": "skipped"}.get(status, "error")
+        rec = {
+            "ts": datetime.fromtimestamp((run_at or created or 0) / 1000, timezone.utc).isoformat(timespec="seconds"),
+            "agent": j["agent"],
+            "trigger": "cron:" + j["name"],
+            "model": actual,
+            "outcome": outcome,
+            "primary": primary,
+            "fell_back": bool(primary and actual and actual != primary),
+            "duration_ms": dur,
+            "total_tokens": tok,
+            "run_id": run_id,
+            "source": "harvest:cron_run_logs",
+        }
+        if outcome == "error" and err:
+            rec["note"] = str(err)[:160]
+        out.append(rec)
+    con.close()
+    if out:
+        os.makedirs(os.path.dirname(LOG), exist_ok=True)
+        with open(LOG, "a", encoding="utf-8") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            for r in out:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+            fcntl.flock(f, fcntl.LOCK_UN)
+    with open(WM, "w") as f:
+        f.write(str(maxc))
+    sys.stderr.write(f"harvested {len(out)} run records (watermark -> {maxc})\n")
+
+
+if __name__ == "__main__":
+    main()

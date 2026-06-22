@@ -1,0 +1,885 @@
+#!/usr/bin/env python3
+"""Drift incident analyzer (phase 2).
+
+For each `open` incident: call an LLM to classify type and propose a typed fix,
+then rewrite the incident file (frontmatter + Analysis section) and move status
+to `proposed`.
+
+Usage:
+  incident-analyze <id>          # one incident
+  incident-analyze --all-open    # all incidents with status=open
+  incident-analyze --dry-run     # don't write back; print proposal
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+ROOT = Path(os.environ.get("OPENCLAW_INCIDENTS_DIR", str(Path.home() / ".openclaw" / "incidents")))
+LEARNINGS_DIR = ROOT / "learnings"
+OPENCLAW = os.environ.get("OPENCLAW_BIN", "openclaw")
+MODEL = os.environ.get("DRIFT_ANALYZER_MODEL", "ollama/glm-5.1:cloud")
+TIMEOUT_S = int(os.environ.get("DRIFT_ANALYZER_TIMEOUT", "120"))
+
+# Telegram destination for drift acks. Both default to empty so the notify/send
+# step becomes a no-op when unset (never errors):
+#   HARNESS_TG_CHAT_ID         — chat/group id to post drift acks into
+#   HARNESS_TG_DRIFT_TOPIC_ID  — topic (thread) id within that chat for drift
+DRIFT_CHAT = os.environ.get("HARNESS_TG_CHAT_ID", "")
+DRIFT_THREAD = os.environ.get("HARNESS_TG_DRIFT_TOPIC_ID", "")
+DRIFT_ACCOUNT = os.environ.get("DRIFT_ACCOUNT", "main")
+
+FRONTMATTER_RE = re.compile(r"^---\n(.*?)\n---\n(.*)$", re.DOTALL)
+
+TAXONOMY = [
+    # Infrastructure / cron failures
+    "model-timeout",
+    "gateway-restart",
+    "agent-no-response",
+    "file-edit-mismatch",
+    "file-read-failed",
+    "delivery-routing",
+    "template-bug",
+    "infra-unavailable",
+    # Behavioral / manual drifts
+    "personality-drift",
+    "tool-usage-drift",
+    "output-quality-drift",
+    "output-repetition-drift",
+    "skill-misfire",
+    # Freshness / pruning
+    "stale-content",
+    "reference-rot",
+    "other",
+]
+FIX_KINDS = [
+    "config-change",
+    "template-patch",
+    "infrastructure",
+    "routing-fix",
+    "skill-patch",
+    "agent-prompt-patch",
+    "investigate",
+]
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# ---------- minimal YAML I/O (same shape as `incident` CLI) ----------
+
+def dump_yaml(d: dict) -> str:
+    """Serialize top-level keys as YAML lines. Nested dicts/lists are inlined as JSON for round-trip safety."""
+    lines = []
+    for k, v in d.items():
+        if v is None:
+            lines.append(f"{k}: null")
+        elif isinstance(v, bool):
+            lines.append(f"{k}: {'true' if v else 'false'}")
+        elif isinstance(v, (int, float)):
+            lines.append(f"{k}: {v}")
+        elif isinstance(v, str):
+            if v == "" or any(c in v for c in ":#\n\"'") or v.strip() != v:
+                lines.append(f"{k}: {json.dumps(v)}")
+            else:
+                lines.append(f"{k}: {v}")
+        elif isinstance(v, (dict, list)):
+            lines.append(f"{k}: {json.dumps(v, ensure_ascii=False)}")
+        else:
+            lines.append(f"{k}: {json.dumps(str(v))}")
+    return "\n".join(lines)
+
+
+def parse_frontmatter(text: str) -> tuple[dict, str]:
+    m = FRONTMATTER_RE.match(text)
+    if not m:
+        raise ValueError("missing frontmatter")
+    fm_text, body = m.group(1), m.group(2)
+    fm: dict = {}
+    stack: list = [(0, fm)]
+    for raw_line in fm_text.split("\n"):
+        if not raw_line.strip():
+            continue
+        indent = len(raw_line) - len(raw_line.lstrip(" "))
+        line = raw_line.strip()
+        while stack and stack[-1][0] >= indent and len(stack) > 1:
+            stack.pop()
+        container = stack[-1][1]
+        if line.startswith("- "):
+            assert isinstance(container, list)
+            container.append(_scalar(line[2:].strip()))
+            continue
+        if ":" not in line:
+            continue
+        k, _, v = line.partition(":")
+        k, v = k.strip(), v.strip()
+        if v == "":
+            new_container: list | dict = {}
+            container[k] = new_container  # type: ignore[index]
+            stack.append((indent + 2, new_container))
+        else:
+            container[k] = _scalar(v)  # type: ignore[index]
+    return fm, body
+
+
+def _scalar(v: str):
+    if v in ("null", "~"):
+        return None
+    if v == "true":
+        return True
+    if v == "false":
+        return False
+    if v.startswith('"') and v.endswith('"'):
+        try:
+            return json.loads(v)
+        except json.JSONDecodeError:
+            return v[1:-1]
+    if v.startswith("{") or v.startswith("["):
+        try:
+            return json.loads(v)
+        except json.JSONDecodeError:
+            return v
+    try:
+        return int(v)
+    except ValueError:
+        pass
+    try:
+        return float(v)
+    except ValueError:
+        pass
+    return v
+
+
+# ---------- ledger access ----------
+
+def iter_incidents() -> list[Path]:
+    out = []
+    if not ROOT.exists():
+        return out
+    for day in sorted(ROOT.iterdir()):
+        if not day.is_dir() or not re.match(r"\d{4}-\d{2}-\d{2}", day.name):
+            continue
+        out.extend(sorted(day.glob("*.md")))
+    return out
+
+
+def find_by_id(inc_id: str) -> Path | None:
+    for f in iter_incidents():
+        try:
+            fm, _ = parse_frontmatter(f.read_text())
+        except Exception:
+            # Fall back to grep-style match on raw id line so an unparseable
+            # legacy file doesn't block lookups.
+            text = f.read_text()
+            m = re.search(r"^id:\s*(\S+)", text, re.MULTILINE)
+            if m and (m.group(1) == inc_id or m.group(1).endswith(inc_id)):
+                return f
+            continue
+        if fm.get("id") == inc_id or (inc_id and fm.get("id", "").endswith(inc_id)):
+            return f
+    return None
+
+
+def load_prior_fixes(source: str, max_n: int = 5) -> list[dict]:
+    """Pull last N proposed/applied incidents of same source for in-context grounding."""
+    out: list[dict] = []
+    for f in reversed(iter_incidents()):
+        try:
+            fm, _ = parse_frontmatter(f.read_text())
+        except Exception:
+            continue
+        if fm.get("source") != source:
+            continue
+        if fm.get("status") not in ("proposed", "applied"):
+            continue
+        out.append({
+            "type": fm.get("type"),
+            "title": fm.get("title"),
+            "fix_kind": (fm.get("proposed_fix") or {}).get("fix_kind") if isinstance(fm.get("proposed_fix"), dict) else None,
+            "proposed_fix": fm.get("proposed_fix"),
+        })
+        if len(out) >= max_n:
+            break
+    return out
+
+
+def load_learnings() -> dict[str, str]:
+    """Load all distilled learnings files (from incident-learn) keyed by type stem.
+
+    Body only — frontmatter is stripped because it's metadata-only and would just pad the prompt.
+    """
+    out: dict[str, str] = {}
+    if not LEARNINGS_DIR.exists():
+        return out
+    for f in sorted(LEARNINGS_DIR.glob("*.md")):
+        try:
+            text = f.read_text()
+        except Exception:
+            continue
+        m = FRONTMATTER_RE.match(text)
+        body = m.group(2).strip() if m else text.strip()
+        out[f.stem] = body
+    return out
+
+
+# ---------- LLM call ----------
+
+def load_target_view(fm: dict, body: str) -> dict:
+    """For cron-sourced incidents, fetch current cron state to ground the planner.
+
+    Returns:
+      {} — non-cron source, or no cron_id extractable from the incident
+      {"_stale_target": True, "cron_id": "..."} — cron_id known but `cron show` failed
+        (cron deleted / recreated under new id). Caller should short-circuit and
+        flip the incident to obsolete rather than asking the LLM to edit a dead UUID.
+      {full target view} — happy path.
+    """
+    if fm.get("source") != "cron":
+        return {}
+    cron_id = None
+    if isinstance(fm.get("fields"), dict):
+        cron_id = fm["fields"].get("job_id") or fm["fields"].get("cron_id")
+    if not cron_id:
+        m = re.search(r"job_id:\s*([0-9a-f-]{36})", body)
+        if m:
+            cron_id = m.group(1)
+    if not cron_id:
+        return {}
+    try:
+        p = subprocess.run([OPENCLAW, "cron", "show", cron_id, "--json"], capture_output=True, text=True, timeout=30)
+        if p.returncode != 0:
+            return {"_stale_target": True, "cron_id": cron_id}
+        doc = json.loads(p.stdout)
+        return {
+            "cron_id": cron_id,
+            "name": doc.get("name"),
+            "agent": doc.get("agentId"),
+            "current_model": (doc.get("payload") or {}).get("model"),
+            "schedule": (doc.get("schedule") or {}).get("expr"),
+        }
+    except Exception:
+        # Transient lookup failure (timeout, parse error). Treat as unknown — let
+        # the planner proceed without a target view rather than falsely marking obsolete.
+        return {}
+
+
+def post_drift(text: str) -> None:
+    """Post a one-line ack to the Drift Telegram topic. Best-effort; failures only warn.
+
+    No-op when HARNESS_TG_CHAT_ID is unset (empty default) so the script never
+    errors out in environments without a configured Telegram destination.
+    """
+    if not DRIFT_CHAT:
+        print("drift post skip: HARNESS_TG_CHAT_ID unset", file=sys.stderr)
+        return
+    cmd = [
+        OPENCLAW, "message", "send",
+        "--channel", "telegram",
+        "--account", DRIFT_ACCOUNT,
+        "--target", DRIFT_CHAT,
+        "--thread-id", DRIFT_THREAD,
+        "--message", text,
+    ]
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if p.returncode != 0:
+            print(f"WARN: drift post failed: {p.stderr[:200]}", file=sys.stderr)
+    except Exception as e:
+        print(f"WARN: drift post raised: {e}", file=sys.stderr)
+
+
+def close_stale_incident(path: Path, fm: dict, body: str, cron_id: str, no_post: bool = False) -> dict:
+    """Flip a stale-target incident to obsolete without invoking the LLM.
+
+    Mirrors the apply-side `stale_target` path (incident-apply.handler_cron_edit):
+    same `obsolete_reason: target_missing` outcome, just reached upstream so we
+    never propose cron-edits on dead UUIDs in the first place.
+    """
+    now = now_iso()
+    fm["status"] = "obsolete"
+    fm["obsolete_at"] = now
+    fm["obsolete_reason"] = "target_missing"
+    fm["analyzed_at"] = now
+    fm["analyzer_model"] = "stale-target-preflight"
+    # Prune any leftover proposal artifacts from prior analyses.
+    for stale in ("proposed_fix", "confidence", "blast_radius", "judge_verdict", "judge_model", "judged_at"):
+        fm.pop(stale, None)
+
+    analysis_block = (
+        "## Analysis\n\n"
+        f"Skipped LLM analysis: cron `{cron_id}` no longer exists "
+        "(`openclaw cron show` returned nonzero). Marked obsolete with "
+        "`obsolete_reason: target_missing` — same outcome the apply-side preflight "
+        "would have produced, just reached upstream so no model time was burned "
+        "proposing edits on a dead UUID.\n"
+    )
+    if "## Analysis" in body:
+        pattern = re.compile(r"## Analysis\n.*?(?=\n## |\Z)", re.DOTALL)
+        body = pattern.sub(lambda _m: analysis_block.rstrip("\n"), body, count=1)
+    else:
+        body = body.rstrip() + f"\n\n{analysis_block}"
+
+    path.write_text(f"---\n{dump_yaml(fm)}\n---\n{body}")
+
+    if not no_post:
+        short_id = (fm.get("id") or "")[-12:]
+        cron_name = (fm.get("fields") or {}).get("cron_name") if isinstance(fm.get("fields"), dict) else None
+        target = cron_name or cron_id
+        post_drift(f"🗑️ {target}: target missing — incident obsolete (analyzer preflight)  ·  id …{short_id}")
+
+    return {"stale_target": True, "status": "obsolete", "cron_id": cron_id, "path": str(path)}
+
+
+def build_prompt(fm: dict, body: str, prior_fixes: list[dict], target_view: dict, learnings: dict[str, str]) -> str:
+    incident_view = {
+        "id": fm.get("id"),
+        "source": fm.get("source"),
+        "title": fm.get("title"),
+        "severity": fm.get("severity"),
+        "agent": fm.get("agent"),
+        "detected_at": fm.get("detected_at"),
+        "fields": fm.get("fields"),
+        "related": fm.get("related"),
+    }
+    prior = "\n".join(f"- {p}" for p in prior_fixes) if prior_fixes else "(none yet)"
+    target_block = json.dumps(target_view, indent=2) if target_view else "(none)"
+    if learnings:
+        learnings_block = "\n\n".join(f"### {t}\n{md}" for t, md in learnings.items())
+    else:
+        learnings_block = "(no distilled learnings yet — fresh ledger)"
+    return f"""You analyze OpenClaw drift incidents and present the user with concise, decidable options.
+
+Audience: a busy founder who needs to skim and pick. Be terse. Don't repeat the title. Don't pad.
+
+HARD COST POLICY — overrides PRIOR FIXES and DISTILLED LEARNINGS when they conflict:
+- Anthropic models (anthropic/claude-*) are NOT on a subscription. Each call is pay-per-token, real money.
+- BANNED FOR CRON USE (do not propose as a swap target — evidence-backed, see learnings/tool-usage-drift.md, learnings/file-edit-mismatch.md):
+  * ollama/kimi-k2.6:cloud — 3/3 file-edit failures, 3 tool-usage-drift incidents
+  Swept out of production crons on 2026-06-01. Treat any proposal that puts it BACK as a regression.
+  Note 2026-06-02: ollama/glm-5.1:cloud was unbanned (false-positive; works fine for everyday use, kept in fallback chains). Allowed Ollama list now: ollama/deepseek-v4-pro:cloud, ollama/glm-5.1:cloud (alias glmpro), ollama/minimax-m3:cloud.
+- For model-swap fixes the priority order is:
+  1. Another Ollama cloud model — allowed targets: ollama/deepseek-v4-pro:cloud (proven stable), ollama/glmpro:cloud, ollama/minimax-m2.7:cloud. Cross within Ollama first. If the failing cron is on Ollama model X, swap to a different Ollama model Y from the allowed list.
+  2. openai/gpt-5.5 — covered by subscription, free at the margin.
+  3. anthropic/claude-haiku-4-5 — only as a last resort and only when reasoning quality is genuinely the bottleneck (not just availability). Cheapest of the Anthropic options.
+- NEVER propose anthropic/claude-sonnet-4-6 for routine model swaps. It's the most expensive Anthropic SKU and the user has explicitly said no.
+- Prior fixes showing "6× sonnet swap, 0 reverts" reflect the OLD policy. Do not weight that history above this current policy.
+
+If you propose any Anthropic model, the `rationale` field MUST explain why Ollama and openai/gpt-5.5 alternatives are unsuitable for this specific incident.
+
+TAXONOMY (type — pick exactly one): {", ".join(TAXONOMY)}
+FIX KINDS (per option — pick exactly one): {", ".join(FIX_KINDS)}
+
+INCIDENT FIELDS:
+{json.dumps(incident_view, indent=2)}
+
+RAW CONTEXT (excerpt of the incident body):
+{body[:4000]}
+
+CURRENT TARGET STATE (the live thing being patched, if known):
+{target_block}
+
+PRIOR FIXES OF SAME SOURCE:
+{prior}
+
+DISTILLED LEARNINGS (compound output of past incidents, grouped by type — let these inform your type classification, options, and confidence; if a fix recipe has applied evidence here, prefer it):
+{learnings_block}
+
+Return a single JSON object — and ONLY that object, no code fences, no preamble — with these exact fields:
+{{
+  "type": "<one of taxonomy>",
+  "problem": ["<1-3 short bullets explaining what's wrong>"],
+  "options": [
+    {{
+      "label": "A",
+      "summary": "<one short imperative sentence; name the file/cron-id/field if known>",
+      "fix_kind": "<one of fix kinds>",
+      "risk": "low|med|high",
+      "reversible": <true|false>,
+      "rationale": "<one short clause; why this would work>",
+      "auto_safe": <true|false>,
+      "apply": {{
+        "handler": "<cron-edit|file-patch|routing-fix|skill-patch|investigate|infrastructure>",
+        "params": {{ /* see HANDLER PARAMS below */ }},
+        "preflight": {{ /* see PREFLIGHT RULE — schema depends on handler */ }} | null,
+        "rationale": "<one short clause>"
+      }}
+    }}
+  ],
+  "recommended": "<label of the option you'd default to, e.g. \\"A\\">",
+  "open_questions": "<one short sentence asking the user what context you're missing, or empty string if none>",
+  "confidence": <0.0 to 1.0>
+}}
+
+HANDLER PARAMS:
+- cron-edit: {{ "cron_id": "<uuid>", "changes": {{ "model": "ollama/deepseek-v4-pro:cloud", "cron": "...", "agent": "..." }} }}
+  Use FULL model strings with provider prefix. Only include fields you actually want to change.
+- file-patch: {{ "path": "<absolute path under ~/.openclaw/{{agents,skills,templates,workspace*}}>",
+                  "old_string": "<EXACT text to replace, with enough surrounding context to be uniquely identifying in the file>",
+                  "new_string": "<EXACT replacement text>",
+                  "intent": "<one-line description>" }}
+  ONLY emit file-patch if you can quote EXACT old_string/new_string. If you don't have file content
+  to ground the strings, use fix_kind=investigate with apply.handler=investigate instead.
+- routing-fix: {{ "merge": {{ "channels": {{...}} OR "routing": {{...}} }},
+                   "intent": "<one-line description>" }}
+  The `merge` is a nested object deep-merged into openclaw.json. Top-level keys MUST be exactly one of
+  "channels" or "routing" — anything else is refused. Example: to add a per-topic systemPrompt:
+  {{ "merge": {{ "channels": {{ "telegram": {{ "accounts": {{ "main": {{ "groups": {{
+       "<CHAT_ID>": {{ "topics": {{ "<TOPIC_ID>": {{ "systemPrompt": "..." }} }} }} }} }} }} }} }} }} }}
+- skill-patch: USE handler=file-patch directly. Skill files live under ~/.openclaw/skills/ which is in
+  the file-patch allowlist. fix_kind=skill-patch is fine as the categorization, but apply.handler
+  must be "file-patch" with the same params as file-patch above. Same preflight rules.
+- investigate: {{ "next_step": "<one-line concrete next action>" }}
+- infrastructure: {{ "manual_step": "<one-line; what the human needs to do>" }}
+
+PREFLIGHT RULE (per option, independently):
+The preflight tests "is this option's desired end state already in place?" Schema varies by handler:
+
+- cron-edit: {{ "type": "command-jsonpath", "command": "openclaw cron show <cron_id> --json",
+                "jsonpath": "payload.model", "equals": "<that option's desired end-state value>" }}
+  (type may be omitted — defaults to command-jsonpath.)
+  → Option that proposes "change model to X": equals=X (and params.changes.model=X).
+  → Option that proposes "leave as current Y": equals=Y (and params.changes.model=Y, idempotent no-op).
+  Each option evaluated independently — do NOT copy one option's `equals` to another.
+
+- file-patch: {{ "type": "string-in-file", "path": "<same as params.path>",
+                 "string": "<usually params.new_string — proves the change is in place>" }}
+
+- routing-fix: {{ "type": "config-equals", "path": "<dot-path into openclaw.json, e.g. channels.telegram.accounts.main.groups.X.topics.Y.systemPrompt>",
+                  "equals": "<the desired value at that path>" }}
+  The path's top segment MUST be `channels` or `routing` (same allowlist as the merge).
+
+- investigate / infrastructure / skill-patch: preflight = null.
+
+IDEMPOTENCY RULE (which option is recommended):
+If `CURRENT TARGET STATE` shows the system is already in a state that addresses the problem
+(e.g., the cron's `current_model` is no longer the one flagged as bad), make the RECOMMENDED option
+the idempotent no-op (set its `changes` and `equals` to the current value). Alternative options
+can still propose other targets — their `equals` is their own proposed target.
+
+Rules:
+- Provide 1-3 options. Order by recommendation (best first). Use labels A, B, C.
+- If no concrete fix is possible, return a single option with fix_kind="investigate" and apply.handler="investigate".
+- "auto_safe" per option is true ONLY if risk=low AND reversible=true AND confidence>=0.85 AND apply.handler is one of [cron-edit].
+- "problem" bullets must be specific; do NOT just restate the title. Each bullet under ~100 chars.
+- "open_questions" should ask for context only the user can provide. Leave empty if you have everything you need.
+- Output the JSON only. Do not output any other text.
+"""
+
+
+def call_model(prompt: str) -> dict:
+    cmd = [OPENCLAW, "infer", "model", "run", "--model", MODEL, "--thinking", "off", "--prompt", prompt, "--json"]
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=TIMEOUT_S)
+    if p.returncode != 0:
+        raise RuntimeError(f"model call failed: {p.stderr.strip() or p.stdout.strip()}")
+    try:
+        envelope = json.loads(p.stdout)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"non-JSON envelope: {e}\n{p.stdout[:500]}")
+    text = (envelope.get("outputs") or [{}])[0].get("text", "")
+    # Strip optional code fences just in case.
+    text = re.sub(r"^```(?:json)?\s*", "", text.strip())
+    text = re.sub(r"\s*```$", "", text.strip())
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as e:
+        # Fallback: try to find a JSON object inside.
+        m = re.search(r"\{.*\}", text, re.DOTALL)
+        if m:
+            return json.loads(m.group(0))
+        raise RuntimeError(f"could not parse JSON from model: {e}\n---\n{text[:500]}")
+
+
+# ---------- analyze + write back ----------
+
+def analyze(path: Path, dry_run: bool = False) -> dict:
+    raw = path.read_text()
+    fm, body = parse_frontmatter(raw)
+    if fm.get("status") != "open":
+        return {"skipped": True, "reason": f"status={fm.get('status')}"}
+
+    prior = load_prior_fixes(fm.get("source", ""))
+    target_view = load_target_view(fm, body)
+    # Stale-target preflight: if the target cron is gone, flip to obsolete and
+    # skip the LLM call entirely. Mirrors the apply-side `stale_target` outcome
+    # (incident-apply ships this 2026-05-29) so dead UUIDs never reach the planner.
+    if target_view.get("_stale_target"):
+        cron_id = target_view.get("cron_id", "")
+        if dry_run:
+            return {"dry_run": True, "stale_target": True, "cron_id": cron_id}
+        return close_stale_incident(path, fm, body, cron_id)
+    learnings = load_learnings()
+    prompt = build_prompt(fm, body, prior, target_view, learnings)
+    proposal = call_model(prompt)
+
+    # Validate proposal shape
+    required = ["type", "problem", "options", "recommended", "confidence"]
+    missing = [k for k in required if k not in proposal]
+    if missing:
+        raise RuntimeError(f"proposal missing fields: {missing}\n{json.dumps(proposal)[:500]}")
+    if proposal["type"] not in TAXONOMY:
+        proposal["type"] = "other"
+    proposal["confidence"] = max(0.0, min(1.0, float(proposal["confidence"])))
+    if not isinstance(proposal["options"], list) or not proposal["options"]:
+        raise RuntimeError(f"options must be a non-empty list\n{json.dumps(proposal)[:500]}")
+    # Validate each option
+    valid_labels = []
+    auto_safe_handlers = {"cron-edit"}
+    for i, opt in enumerate(proposal["options"][:3]):
+        opt.setdefault("label", chr(ord("A") + i))
+        if opt.get("fix_kind") not in FIX_KINDS:
+            opt["fix_kind"] = "investigate"
+        if opt.get("risk") not in ("low", "med", "high"):
+            opt["risk"] = "med"
+        opt["reversible"] = bool(opt.get("reversible", False))
+        # Sanitize apply block
+        ap = opt.get("apply")
+        if not isinstance(ap, dict):
+            ap = {"handler": opt["fix_kind"] if opt["fix_kind"] in ("investigate", "infrastructure") else "investigate", "params": {}, "preflight": None, "rationale": "no structured apply emitted"}
+        ap.setdefault("params", {})
+        ap.setdefault("preflight", None)
+        ap.setdefault("rationale", "")
+        opt["apply"] = ap
+        # auto_safe gate: low + reversible + high confidence + a handler we can actually run
+        opt["auto_safe"] = (
+            bool(opt.get("auto_safe", False))
+            and opt["risk"] == "low"
+            and opt["reversible"]
+            and proposal["confidence"] >= 0.85
+            and ap.get("handler") in auto_safe_handlers
+        )
+        valid_labels.append(opt["label"])
+    proposal["options"] = proposal["options"][:3]
+    if proposal.get("recommended") not in valid_labels:
+        proposal["recommended"] = valid_labels[0]
+    proposal.setdefault("open_questions", "")
+
+    if dry_run:
+        return {"dry_run": True, "proposal": proposal}
+
+    # Write back: update fm + replace Analysis section
+    # Prune any stale top-level keys from the prior (single-fix) schema.
+    for stale in ("summary", "root_cause", "fix_kind", "auto_safe", "rationale"):
+        fm.pop(stale, None)
+
+    fm["type"] = proposal["type"]
+    fm["status"] = "proposed"
+    fm["proposed_fix"] = proposal
+    fm["confidence"] = proposal["confidence"]
+    # Keep blast_radius at incident level = recommended option's risk
+    rec_opt = next((o for o in proposal["options"] if o["label"] == proposal["recommended"]), proposal["options"][0])
+    fm["blast_radius"] = rec_opt["risk"]
+    fm["analyzed_at"] = now_iso()
+    fm["analyzer_model"] = MODEL
+
+    analysis_block = f"## Analysis\n\n```json\n{json.dumps(proposal, indent=2)}\n```\n"
+    if "## Analysis" in body:
+        # Replace the entire existing Analysis section (up to the next ## heading or EOF).
+        # Use a lambda replacement so re.sub doesn't interpret \u escapes in the replacement.
+        pattern = re.compile(r"## Analysis\n.*?(?=\n## |\Z)", re.DOTALL)
+        body = pattern.sub(lambda _m: analysis_block.rstrip("\n"), body, count=1)
+    else:
+        body += f"\n{analysis_block}"
+
+    path.write_text(f"---\n{dump_yaml(fm)}\n---\n{body}")
+    return {"proposal": proposal, "path": str(path)}
+
+
+APPLY_CLI = os.environ.get("APPLY_CLI", str(Path(__file__).resolve().parent / "incident-apply"))
+NOTIFY_CLI = os.environ.get("NOTIFY_CLI", str(Path(__file__).resolve().parent / "incident-notify"))
+JUDGE_MODEL = os.environ.get("DRIFT_JUDGE_MODEL", "ollama/kimi-k2.6:cloud")
+JUDGE_ENABLED = os.environ.get("DRIFT_JUDGE", "1") not in ("0", "false", "no")
+JUDGE_TIMEOUT_S = int(os.environ.get("DRIFT_JUDGE_TIMEOUT", "60"))
+JUDGE_RECENT_WINDOW_MIN = int(os.environ.get("DRIFT_JUDGE_WINDOW_MIN", "30"))
+JUDGE_RECENT_MAX = int(os.environ.get("DRIFT_JUDGE_RECENT_MAX", "15"))
+
+
+def _load_recent_incidents(window_min: int, max_n: int) -> list[dict]:
+    """Pull last N incidents (any status) for the judge's broader-context view.
+
+    Returned compact: title, type, status, fields summary, detected_at.
+    """
+    from datetime import timedelta
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=window_min)
+    out: list[dict] = []
+    for f in reversed(iter_incidents()):
+        try:
+            fm, _ = parse_frontmatter(f.read_text())
+        except Exception:
+            continue
+        ts_raw = fm.get("detected_at") or ""
+        try:
+            ts = datetime.strptime(ts_raw, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        except Exception:
+            continue
+        if ts < cutoff:
+            continue
+        fields = fm.get("fields") if isinstance(fm.get("fields"), dict) else {}
+        out.append({
+            "id_tail": (fm.get("id") or "")[-12:],
+            "type": fm.get("type"),
+            "status": fm.get("status"),
+            "agent": fm.get("agent"),
+            "detected_at": ts_raw,
+            "cron_name": fields.get("cron_name"),
+            "model": fields.get("model"),
+            "error_excerpt": (fields.get("error_excerpt") or "")[:120],
+        })
+        if len(out) >= max_n:
+            break
+    return out
+
+
+def _judge_prompt(fm: dict, body: str, proposal: dict, rec_opt: dict, recent: list[dict], learnings: dict[str, str]) -> str:
+    """Second-opinion prompt. Judge ≠ planner — its only job is yes/no with reasoning."""
+    incident_view = {
+        "id": fm.get("id"),
+        "type": fm.get("type"),
+        "agent": fm.get("agent"),
+        "severity": fm.get("severity"),
+        "fields": fm.get("fields"),
+    }
+    learnings_block = (
+        "\n\n".join(f"### {t}\n{md}" for t, md in learnings.items())
+        if learnings else "(none yet)"
+    )
+    return f"""You are the JUDGE for the OpenClaw incident pipeline. The ANALYZER has already proposed a fix and recommended auto-applying it. Your job is to decide: does this fix actually address the root cause, given everything we know? Return yes or no.
+
+You are not the planner. You don't propose alternatives. You either approve auto-apply or decline (in which case a human will be asked).
+
+INCIDENT:
+{json.dumps(incident_view, indent=2)}
+
+ERROR EXCERPT (raw):
+{body[:1500]}
+
+RECOMMENDED OPTION (the one that would be auto-applied):
+{json.dumps(rec_opt, indent=2)}
+
+OTHER OPTIONS THE ANALYZER CONSIDERED:
+{json.dumps([o for o in proposal.get("options", []) if o.get("label") != rec_opt.get("label")], indent=2)}
+
+RECENT INCIDENTS (last {JUDGE_RECENT_WINDOW_MIN} min, any source/agent — this is your weather-vs-config signal):
+{json.dumps(recent, indent=2)}
+
+DISTILLED LEARNINGS (compound output of past incidents — fix recipes with evidence):
+{learnings_block}
+
+DECISION CRITERIA — decline auto-apply if ANY of these hold:
+1. Provider outage signal: ≥2 unrelated cron failures in the recent window across different providers/models → this is weather, not config. Wait, don't swap.
+2. Same fix already attempted on a recent incident of the same type without addressing the root cause (e.g. "swap to model X" was applied and the next run on model X failed the same way).
+3. The recommended fix is a no-op (params match current state) AND the underlying problem persists.
+4. The error pattern indicates a tool-discipline issue (file-edit-mismatch, file-read-failed, write-to-existing-file) — model swap will NOT fix this; needs corrective-retry or prompt patch instead.
+5. The recommended fix changes a high-traffic shared resource (handoff files, openclaw.json routing) without enough evidence the change is the cause.
+
+Otherwise APPROVE.
+
+Return a single JSON object — no fences, no preamble:
+{{
+  "apply": <true|false>,
+  "reasoning": "<one short paragraph (≤2 sentences). If declining, say WHY in user-actionable terms (e.g. 'provider weather — 3 same-minute failures across ollama+anthropic, recommend waiting'). If approving, one short sentence is enough.>"
+}}
+"""
+
+
+def call_judge(fm: dict, body: str, proposal: dict, rec_opt: dict) -> dict:
+    """Returns {apply: bool, reasoning: str}. Defaults to {apply: True, reasoning: 'judge disabled/unavailable'} on any failure so we don't accidentally block all auto-apply when the judge model is down."""
+    if not JUDGE_ENABLED:
+        return {"apply": True, "reasoning": "judge disabled (DRIFT_JUDGE=0)"}
+    try:
+        recent = _load_recent_incidents(JUDGE_RECENT_WINDOW_MIN, JUDGE_RECENT_MAX)
+        learnings = load_learnings()
+        prompt = _judge_prompt(fm, body, proposal, rec_opt, recent, learnings)
+        cmd = [OPENCLAW, "infer", "model", "run", "--model", JUDGE_MODEL, "--thinking", "off", "--prompt", prompt, "--json"]
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=JUDGE_TIMEOUT_S)
+        if p.returncode != 0:
+            return {"apply": True, "reasoning": f"judge call failed (fail-open): {p.stderr.strip()[:200]}"}
+        envelope = json.loads(p.stdout)
+        text = (envelope.get("outputs") or [{}])[0].get("text", "")
+        text = re.sub(r"^```(?:json)?\s*", "", text.strip())
+        text = re.sub(r"\s*```$", "", text.strip())
+        m = re.search(r"\{.*\}", text, re.DOTALL)
+        if not m:
+            return {"apply": True, "reasoning": "judge returned no parseable JSON (fail-open)"}
+        verdict = json.loads(m.group(0))
+        return {
+            "apply": bool(verdict.get("apply", True)),
+            "reasoning": str(verdict.get("reasoning", "")).strip() or "(no reasoning)",
+        }
+    except Exception as e:
+        return {"apply": True, "reasoning": f"judge error (fail-open): {str(e)[:200]}"}
+
+
+def auto_safe_apply(path: Path, proposal: dict) -> dict | None:
+    """If the recommended option is auto_safe AND the judge approves, auto-apply.
+
+    Returns a result dict from incident-apply, a {judge_declined: ...} dict if the
+    judge blocked it, or None if the option isn't auto_safe at all.
+    """
+    rec_label = proposal.get("recommended")
+    rec_opt = next((o for o in proposal.get("options") or [] if o.get("label") == rec_label), None)
+    if not rec_opt or not rec_opt.get("auto_safe"):
+        return None
+
+    # Judge gate: second-opinion LLM reads recent context + learnings before we auto-apply.
+    raw = path.read_text()
+    fm, body = parse_frontmatter(raw)
+    verdict = call_judge(fm, body, proposal, rec_opt)
+
+    # Persist verdict on the incident either way (so notify can surface declines, and history is auditable).
+    fm["judge_verdict"] = verdict
+    fm["judge_model"] = JUDGE_MODEL
+    fm["judged_at"] = now_iso()
+
+    if not verdict.get("apply", True):
+        # Declined — keep status=proposed so the normal notify path picks it up and surfaces the judge's reasoning.
+        path.write_text(f"---\n{dump_yaml(fm)}\n---\n{body}")
+        return {"judge_declined": True, "reasoning": verdict.get("reasoning", "")}
+
+    # Approved — proceed with auto-approve + apply.
+    fm["status"] = f"approved-{rec_label}"
+    fm["decided_at"] = now_iso()
+    fm["decided_choice"] = rec_label
+    fm["decided_by"] = "auto-safe"
+
+    decision_block = "## Decision\n\n```\n" + json.dumps({
+        "choice": rec_label,
+        "note": "",
+        "decided_at": fm["decided_at"],
+        "via": "auto-safe",
+        "chosen_option": rec_opt,
+        "new_status": fm["status"],
+    }, indent=2) + "\n```\n"
+    if "## Decision" in body:
+        body = re.sub(r"## Decision\n.*?(?=\n## |\Z)", lambda _m: decision_block.rstrip("\n"), body, count=1, flags=re.DOTALL)
+    else:
+        body = body.rstrip() + "\n\n" + decision_block
+    path.write_text(f"---\n{dump_yaml(fm)}\n---\n{body}")
+
+    # Run incident-apply
+    inc_id = fm.get("id", "")
+    p = subprocess.run([APPLY_CLI, inc_id], capture_output=True, text=True, timeout=300)
+    if p.returncode != 0:
+        return {"auto_apply": "failed", "stderr": p.stderr[:500], "stdout": p.stdout[:500]}
+    try:
+        return {"auto_apply": "ok", "result": json.loads(p.stdout)}
+    except json.JSONDecodeError:
+        return {"auto_apply": "ok", "stdout": p.stdout[:500]}
+
+
+# ---------- CLI ----------
+
+def cmd_one(args):
+    path = find_by_id(args.id)
+    if not path:
+        print(f"not found: {args.id}", file=sys.stderr)
+        return 1
+    result = analyze(path, dry_run=args.dry_run)
+    if args.auto_safe and not args.dry_run and "proposal" in result:
+        auto_result = auto_safe_apply(path, result["proposal"])
+        if auto_result is not None:
+            result["auto_safe_apply"] = auto_result
+    print(json.dumps(result, indent=2))
+    return 0
+
+
+def cmd_all_open(args):
+    n_ok = n_skip = n_err = n_auto_ok = n_auto_failed = n_judge_declined = n_notified = n_stale = 0
+    for f in iter_incidents():
+        fm, _ = parse_frontmatter(f.read_text())
+        if fm.get("status") != "open":
+            n_skip += 1
+            continue
+        try:
+            result = analyze(f, dry_run=args.dry_run)
+            if result.get("skipped"):
+                n_skip += 1
+            elif result.get("stale_target"):
+                # Preflight closed it as obsolete — no LLM call, no proposal, no notify.
+                n_stale += 1
+                if args.verbose:
+                    print(f"  {fm.get('id', '?')[-30:]}  STALE-TARGET cron={result.get('cron_id','?')[:8]}…  → obsolete")
+                continue
+            else:
+                n_ok += 1
+                auto_applied = False
+                if args.auto_safe and not args.dry_run and "proposal" in result:
+                    auto_result = auto_safe_apply(f, result["proposal"])
+                    if auto_result is not None:
+                        if auto_result.get("auto_apply") == "ok":
+                            n_auto_ok += 1
+                            auto_applied = True
+                        elif auto_result.get("auto_apply") == "failed":
+                            n_auto_failed += 1
+                            fm_err, body_err = parse_frontmatter(f.read_text())
+                            fm_err["apply_error"] = {
+                                "stderr": auto_result.get("stderr", "")[:1000],
+                                "stdout": auto_result.get("stdout", "")[:1000],
+                                "at": now_iso(),
+                            }
+                            f.write_text(f"---\n{dump_yaml(fm_err)}\n---\n{body_err}")
+                        elif auto_result.get("judge_declined"):
+                            n_judge_declined += 1
+                # Notify path: only when human action is needed.
+                # Skip if auto-applied (incident-apply posted its own ack) or already notified.
+                # Gate on signal strength: notify only when something could break or needs a call.
+                #   - judge declined an auto_safe (something was tried and blocked)
+                #   - severity med/high
+                #   - blast_radius med/high
+                # Low-low routine proposals sit silently in status=proposed until weekly review.
+                if args.notify and not args.dry_run and not auto_applied:
+                    fm_after, body_after = parse_frontmatter(f.read_text())
+                    if fm_after.get("status") in ("proposed", "open") and not fm_after.get("notified_at"):
+                        sev = (fm_after.get("severity") or "low").lower()
+                        blast = (fm_after.get("blast_radius") or "low").lower()
+                        judge = fm_after.get("judge_verdict") or {}
+                        judge_declined = isinstance(judge, dict) and judge.get("apply") is False
+                        worth_notifying = (
+                            judge_declined
+                            or sev in ("med", "high")
+                            or blast in ("med", "high")
+                        )
+                        if worth_notifying:
+                            n = subprocess.run([NOTIFY_CLI, fm_after.get("id", "")], capture_output=True, text=True)
+                            if n.returncode == 0:
+                                fm_after["notified_at"] = now_iso()
+                                f.write_text(f"---\n{dump_yaml(fm_after)}\n---\n{body_after}")
+                                n_notified += 1
+                            else:
+                                print(f"WARN: notify failed for {fm_after.get('id', '?')}: {n.stderr[:200]}", file=sys.stderr)
+                if args.verbose:
+                    p = result["proposal"]
+                    opts = p.get("options") or []
+                    rec = next((o for o in opts if o.get("label") == p.get("recommended")), opts[0] if opts else {})
+                    print(f"  {fm.get('id', '?')[-30:]}  type={p.get('type','?'):22}  rec={rec.get('fix_kind','?'):18}  conf={p.get('confidence',0):.2f}  risk={rec.get('risk','?')}")
+        except Exception as e:
+            n_err += 1
+            print(f"  ERR {fm.get('id', '?')}: {e}", file=sys.stderr)
+    print(f"analyzed={n_ok} skipped={n_skip} stale_target={n_stale} errors={n_err} auto_applied_ok={n_auto_ok} auto_apply_failed={n_auto_failed} judge_declined={n_judge_declined} notified={n_notified}")
+    return 0 if n_err == 0 else 1
+
+
+def main():
+    p = argparse.ArgumentParser(prog="incident-analyze")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--all-open", action="store_true")
+    p.add_argument("--verbose", "-v", action="store_true")
+    p.add_argument("--auto-safe", action="store_true", help="After analyzing, if recommended option is auto_safe, auto-approve and apply (phase 3c)")
+    p.add_argument("--notify", action="store_true", help="(with --all-open) Send Drift notify for any proposed incident not yet notified. Skipped on auto-apply.")
+    p.add_argument("id", nargs="?")
+    args = p.parse_args()
+    if args.all_open:
+        return cmd_all_open(args)
+    if not args.id:
+        p.error("provide an incident id or --all-open")
+    return cmd_one(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

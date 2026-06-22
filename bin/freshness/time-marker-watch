@@ -1,0 +1,371 @@
+#!/usr/bin/env python3
+"""Freshness emitter: time-marker rot.
+
+Walks workspace markdown files; for each file:
+  1. Apply policy from ${OPENCLAW_HOME}/freshness-policy.json (path-glob → lifespan)
+  2. Frontmatter `lifespan:` field overrides policy
+  3. For non-evergreen, non-marker lifespans:
+       - Nd      → expired if (today - mtime) > N days
+       - YYYY-MM-DD → expired if today > date
+  4. Emit Drift incident for each expired file (via `incident emit`)
+  5. Also scan body for past-date markers like "Deadline: 2026-05-24" — emit
+     a lighter "review" incident (severity=low, no auto-archive proposal).
+
+Usage:
+  time-marker-watch                  # dry-run (default — prints candidates, NO emit)
+  time-marker-watch --commit         # actually emit incidents
+  time-marker-watch --max N          # cap emissions per run (default 25)
+  time-marker-watch --since-mtime    # only consider files whose mtime aged past lifespan
+
+Policy file: ${OPENCLAW_HOME}/freshness-policy.json
+"""
+# SPDX-License-Identifier: MIT
+# Part of agent-harness (https://github.com/${GH_ORG}/agent-harness)
+from __future__ import annotations
+
+import argparse
+import fnmatch
+import json
+import os
+import re
+import subprocess
+import sys
+from datetime import date, datetime, timezone
+from pathlib import Path
+
+HOME = Path(os.environ.get("HOME", os.path.expanduser("~")))
+OPENCLAW_HOME = Path(os.environ.get("OPENCLAW_HOME", os.path.expanduser("~/.openclaw")))
+OPENCLAW = OPENCLAW_HOME
+POLICY_FILE = OPENCLAW / "freshness-policy.json"
+INCIDENT_CLI = os.environ.get("INCIDENT_CLI", str(OPENCLAW / "bin" / "incident"))
+
+
+def _load_agents_map():
+    """Return list of (agent_id, workspace_dir, persona) from config/agents.map."""
+    here = Path(__file__).resolve()
+    candidates = []
+    env_map = os.environ.get("AGENTS_MAP")
+    if env_map:
+        candidates.append(Path(env_map))
+    candidates.append(OPENCLAW_HOME / "config" / "agents.map")
+    candidates.append(here.parent.parent.parent / "config" / "agents.map")
+    for c in candidates:
+        try:
+            if c.is_file():
+                rows = []
+                for line in c.read_text(encoding="utf-8").splitlines():
+                    line = line.split("#", 1)[0].strip()
+                    if not line:
+                        continue
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        rows.append((parts[0], parts[1], parts[2]))
+                if rows:
+                    return rows
+        except OSError:
+            continue
+    return [("main", "workspace", "Orchestrator"), ("dev", "workspace-dev", "Developer")]
+
+
+AGENTS = _load_agents_map()
+# Workspace roots across all configured agents.
+WORKSPACES = [OPENCLAW / ws for _aid, ws, _persona in AGENTS]
+
+FRONTMATTER_RE = re.compile(r"^---\n(.*?)\n---", re.DOTALL)
+LIFESPAN_RE = re.compile(r"^lifespan:\s*(\S+)\s*$", re.MULTILINE)
+DURATION_RE = re.compile(r"^(\d+)d$")
+DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+# Body date markers we'll flag (past-date in active context).
+# Conservative regex; we want low false positives.
+DATE_MARKER_PATTERNS = [
+    re.compile(r"\b(?:deadline|due|apply by|expires?|by)[:\s]+(?:on\s+)?(\d{4}-\d{2}-\d{2})\b", re.IGNORECASE),
+    re.compile(r"\b(?:deadline|due|apply by|expires?)[:\s]+(\d{1,2}\s+\w+\s+\d{4})\b", re.IGNORECASE),
+]
+
+
+def load_policy() -> dict:
+    if not POLICY_FILE.exists():
+        print(f"WARN: {POLICY_FILE} not found — using evergreen default", file=sys.stderr)
+        return {"skip_patterns": [], "policies": [], "default_lifespan": "evergreen"}
+    return json.loads(POLICY_FILE.read_text())
+
+
+def matches_glob(path: str, glob: str) -> bool:
+    return fnmatch.fnmatch(path, glob)
+
+
+def resolve_lifespan(file_path: Path, policy: dict) -> tuple[str, str]:
+    """Return (lifespan_value, source_label)."""
+    rel = str(file_path)
+    # Frontmatter override
+    try:
+        text = file_path.read_text(errors="replace")[:4000]
+        m = FRONTMATTER_RE.match(text)
+        if m:
+            fm_text = m.group(1)
+            m2 = LIFESPAN_RE.search(fm_text)
+            if m2:
+                return m2.group(1), "frontmatter"
+    except Exception:
+        pass
+    # Path-policy
+    for entry in policy.get("policies", []):
+        if matches_glob(rel, entry["path_glob"]):
+            return entry["lifespan"], f"policy:{entry['path_glob']}"
+    return policy.get("default_lifespan", "evergreen"), "default"
+
+
+def should_skip(file_path: Path, policy: dict) -> bool:
+    rel = str(file_path)
+    for pat in policy.get("skip_patterns", []):
+        if matches_glob(rel, pat):
+            return True
+    return False
+
+
+def is_expired(lifespan: str, mtime: float) -> tuple[bool, str]:
+    today = date.today()
+    if lifespan in ("evergreen", "until-superseded", "until-marked-done"):
+        return False, lifespan
+    m = DURATION_RE.match(lifespan)
+    if m:
+        days = int(m.group(1))
+        age_days = (datetime.now(timezone.utc) - datetime.fromtimestamp(mtime, tz=timezone.utc)).days
+        if age_days > days:
+            return True, f"age={age_days}d > {days}d"
+        return False, f"age={age_days}d ≤ {days}d"
+    if DATE_RE.match(lifespan):
+        try:
+            exp = date.fromisoformat(lifespan)
+            if today > exp:
+                return True, f"past {lifespan}"
+            return False, f"not yet {lifespan}"
+        except Exception:
+            return False, f"bad-date:{lifespan}"
+    return False, f"unknown:{lifespan}"
+
+
+def scan_body_date_markers(text: str) -> list[tuple[str, str]]:
+    """Return [(matched_text, parsed_date_iso)] for past-date markers."""
+    out = []
+    today = date.today()
+    for pat in DATE_MARKER_PATTERNS:
+        for m in pat.finditer(text):
+            raw = m.group(1)
+            parsed = None
+            try:
+                parsed = date.fromisoformat(raw)
+            except ValueError:
+                # Try "1 May 2026" / "May 24 2026" style
+                for fmt in ("%d %B %Y", "%B %d %Y", "%d %b %Y", "%b %d %Y"):
+                    try:
+                        parsed = datetime.strptime(raw, fmt).date()
+                        break
+                    except ValueError:
+                        continue
+            if parsed and today > parsed:
+                out.append((m.group(0), parsed.isoformat()))
+    return out
+
+
+def emit_incident(title: str, agent: str, fields: dict, related: dict, body: str, dedup_key: str, dry_run: bool) -> tuple[bool, str]:
+    if dry_run:
+        return True, "(dry-run)"
+    cmd = [
+        INCIDENT_CLI, "emit",
+        "--source", "freshness",
+        "--severity", "low",
+        "--title", title,
+        "--agent", agent or "unknown",
+        "--key", dedup_key,
+        "--fields-json", json.dumps(fields),
+        "--related-json", json.dumps(related),
+    ]
+    p = subprocess.run(cmd, input=body, capture_output=True, text=True, timeout=30)
+    if p.returncode != 0:
+        return False, (p.stderr or p.stdout).strip()
+    return True, p.stdout.strip()
+
+
+def workspace_agent(path: Path) -> str:
+    """Infer agent name from workspace root."""
+    for ws in WORKSPACES:
+        try:
+            path.relative_to(ws)
+            name = ws.name
+            return name.replace("workspace-", "") if name != "workspace" else "main"
+        except ValueError:
+            continue
+    return "unknown"
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(prog="time-marker-watch")
+    p.add_argument("--commit", action="store_true", help="actually emit incidents (default is dry-run)")
+    p.add_argument("--max", type=int, default=25, help="cap emissions per run")
+    p.add_argument("--scan-body", action="store_true", default=True, help="scan body for past-date markers (default on)")
+    p.add_argument("--no-scan-body", dest="scan_body", action="store_false")
+    p.add_argument("--verbose", "-v", action="store_true")
+    args = p.parse_args()
+
+    policy = load_policy()
+    candidates_expired = []
+    candidates_body_markers = []
+    scanned = 0
+
+    for ws in WORKSPACES:
+        if not ws.exists():
+            continue
+        for f in ws.rglob("*.md"):
+            scanned += 1
+            if should_skip(f, policy):
+                continue
+            lifespan, source = resolve_lifespan(f, policy)
+            if lifespan in ("evergreen", "until-superseded", "until-marked-done"):
+                # Still scan body for past-date markers if scan_body is on
+                if args.scan_body:
+                    try:
+                        text = f.read_text(errors="replace")[:50000]
+                    except Exception:
+                        continue
+                    markers = scan_body_date_markers(text)
+                    for marker_text, marker_iso in markers:
+                        candidates_body_markers.append({
+                            "file": str(f),
+                            "marker_text": marker_text[:200],
+                            "marker_date": marker_iso,
+                            "lifespan": lifespan,
+                        })
+                continue
+            try:
+                mtime = f.stat().st_mtime
+            except Exception:
+                continue
+            expired, why = is_expired(lifespan, mtime)
+            if expired:
+                candidates_expired.append({
+                    "file": str(f),
+                    "lifespan": lifespan,
+                    "source": source,
+                    "why": why,
+                    "mtime": mtime,
+                })
+
+    # .txt files in workspaces (scout-*.txt is the main one)
+    for ws in WORKSPACES:
+        if not ws.exists():
+            continue
+        for f in ws.rglob("*.txt"):
+            scanned += 1
+            if should_skip(f, policy):
+                continue
+            lifespan, source = resolve_lifespan(f, policy)
+            if lifespan in ("evergreen", "until-superseded", "until-marked-done"):
+                continue
+            try:
+                mtime = f.stat().st_mtime
+            except Exception:
+                continue
+            expired, why = is_expired(lifespan, mtime)
+            if expired:
+                candidates_expired.append({
+                    "file": str(f),
+                    "lifespan": lifespan,
+                    "source": source,
+                    "why": why,
+                    "mtime": mtime,
+                })
+
+    # Cap emissions
+    candidates_expired.sort(key=lambda c: c["mtime"])  # oldest first
+    candidates_body_markers.sort(key=lambda c: c["marker_date"])  # oldest marker first
+    n_cap = args.max
+    capped_expired = candidates_expired[:n_cap]
+    remaining_for_markers = max(0, n_cap - len(capped_expired))
+    capped_markers = candidates_body_markers[:remaining_for_markers]
+
+    mode = "COMMIT" if args.commit else "DRY-RUN"
+    print(f"=== time-marker-watch ({mode}) ===")
+    print(f"scanned: {scanned} files | expired: {len(candidates_expired)} | body-markers: {len(candidates_body_markers)} | cap: {n_cap}")
+    print()
+
+    emitted = 0
+    for c in capped_expired:
+        f = Path(c["file"])
+        agent = workspace_agent(f)
+        title = f"Stale file (expired {c['lifespan']}): {f.name}"
+        fields = {
+            "file_path": c["file"],
+            "lifespan": c["lifespan"],
+            "policy_source": c["source"],
+            "why": c["why"],
+            "mtime_iso": datetime.fromtimestamp(c["mtime"], tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+        related = {"agent": agent}
+        body_lines = [
+            f"# Stale file",
+            f"file_path: {c['file']}",
+            f"lifespan: {c['lifespan']}",
+            f"policy_source: {c['source']}",
+            f"why: {c['why']}",
+            "",
+            "## Proposed action",
+            f"Archive to cold-storage (workspace-relative path preserved), OR mark file with `lifespan: evergreen` in frontmatter if it should be kept.",
+        ]
+        dedup_key = f"freshness-time-marker-{c['file']}-{c['mtime']:.0f}"
+        if args.verbose or not args.commit:
+            print(f"  EXPIRED  {c['file']}")
+            print(f"           lifespan={c['lifespan']}  source={c['source']}  {c['why']}")
+        if args.commit:
+            ok, msg = emit_incident(title, agent, fields, related, "\n".join(body_lines), dedup_key, dry_run=False)
+            if ok:
+                emitted += 1
+                if args.verbose:
+                    print(f"           emitted: {msg}")
+            else:
+                print(f"           WARN emit failed: {msg}", file=sys.stderr)
+
+    for c in capped_markers:
+        f = Path(c["file"])
+        agent = workspace_agent(f)
+        title = f"Past-date marker in evergreen file: {f.name}"
+        fields = {
+            "file_path": c["file"],
+            "marker_text": c["marker_text"],
+            "marker_date": c["marker_date"],
+            "lifespan": c["lifespan"],
+        }
+        related = {"agent": agent}
+        body_lines = [
+            f"# Past-date marker found in evergreen file",
+            f"file_path: {c['file']}",
+            f"marker: {c['marker_text']}",
+            f"marker_date: {c['marker_date']}",
+            "",
+            "## Proposed action",
+            "Review the section containing this date marker — likely needs update, strikethrough, or move to a completed/archive section. File overall is evergreen so don't archive the whole file.",
+        ]
+        dedup_key = f"freshness-body-marker-{c['file']}-{c['marker_date']}"
+        if args.verbose or not args.commit:
+            print(f"  MARKER   {c['file']}")
+            print(f"           {c['marker_text']!r} ({c['marker_date']})")
+        if args.commit:
+            ok, msg = emit_incident(title, agent, fields, related, "\n".join(body_lines), dedup_key, dry_run=False)
+            if ok:
+                emitted += 1
+                if args.verbose:
+                    print(f"           emitted: {msg}")
+            else:
+                print(f"           WARN emit failed: {msg}", file=sys.stderr)
+
+    print()
+    n_skipped = max(0, (len(candidates_expired) + len(candidates_body_markers)) - n_cap)
+    print(f"emitted: {emitted} | skipped (cap): {n_skipped}")
+    if not args.commit:
+        print("(dry-run — no incidents emitted. Run with --commit to emit.)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

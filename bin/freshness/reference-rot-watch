@@ -1,0 +1,423 @@
+#!/usr/bin/env python3
+"""Freshness emitter: reference rot.
+
+Scans workspace markdown files for references that no longer resolve:
+  - Skill paths: `skills/<name>/` or `skills/<name>/SKILL.md` references where
+    no such skill directory exists.
+  - Agent IDs: `agent: <name>` frontmatter or inline mentions of agents that
+    no longer have an ${OPENCLAW_HOME}/agents/<name>/ entry.
+  - Internal markdown links `[text](path)` where path looks like a workspace
+    slug (no scheme, segmented path, .md or no extension) but doesn't exist
+    in any current workspace or gbrain.
+
+Conservative by design: only flags HIGH-CONFIDENCE rot signals to avoid
+emission storms. Things we explicitly do NOT scan: cron-id UUIDs (too noisy),
+bare slugs without link syntax, external URLs.
+
+Usage:
+  reference-rot-watch                  # dry-run (default)
+  reference-rot-watch --commit         # emit incidents
+  reference-rot-watch --max N          # cap per run (default 25)
+  reference-rot-watch --check-gbrain   # also validate against gbrain slug set (slow)
+"""
+# SPDX-License-Identifier: MIT
+# Part of agent-harness (https://github.com/${GH_ORG}/agent-harness)
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+HOME = Path(os.environ.get("HOME", os.path.expanduser("~")))
+OPENCLAW_HOME = Path(os.environ.get("OPENCLAW_HOME", os.path.expanduser("~/.openclaw")))
+OPENCLAW = OPENCLAW_HOME
+INCIDENT_CLI = os.environ.get("INCIDENT_CLI", str(OPENCLAW / "bin" / "incident"))
+GBRAIN = os.environ.get("GBRAIN_BIN", str(HOME / ".bun" / "bin" / "gbrain"))
+
+
+def _load_agents_map():
+    """Return list of (agent_id, workspace_dir, persona) from config/agents.map."""
+    here = Path(__file__).resolve()
+    candidates = []
+    env_map = os.environ.get("AGENTS_MAP")
+    if env_map:
+        candidates.append(Path(env_map))
+    candidates.append(OPENCLAW_HOME / "config" / "agents.map")
+    candidates.append(here.parent.parent.parent / "config" / "agents.map")
+    for c in candidates:
+        try:
+            if c.is_file():
+                rows = []
+                for line in c.read_text(encoding="utf-8").splitlines():
+                    line = line.split("#", 1)[0].strip()
+                    if not line:
+                        continue
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        rows.append((parts[0], parts[1], parts[2]))
+                if rows:
+                    return rows
+        except OSError:
+            continue
+    return [("main", "workspace", "Orchestrator"), ("dev", "workspace-dev", "Developer")]
+
+
+AGENTS = _load_agents_map()
+# Workspace roots across all configured agents.
+WORKSPACES = [OPENCLAW / ws for _aid, ws, _persona in AGENTS]
+
+SKILL_DIRS = [
+    OPENCLAW / "skills",
+    OPENCLAW / "plugin-skills",
+]
+
+AGENT_DIR = OPENCLAW / "agents"
+
+# Two scan modes — both require explicit reference syntax, not bare-text prose:
+#   1. Markdown link: [text](path)
+#   2. Backtick code-span: `path` (single backticks only, no fenced blocks)
+# Bare-text mentions ("see the skills/instructions section") would match these
+# patterns too loosely, so we deliberately don't scan them.
+MD_LINK_RE = re.compile(r"\[[^\]]+\]\(([^)\s]+)\)")
+# Single-backtick code-span. Content must be a slug-or-skill path (skills/X, audits/X, etc).
+BACKTICK_REF_RE = re.compile(r"`([a-z][a-z0-9-]*/[A-Za-z0-9_./\-]+)`")
+# Extract skill name from a skills/<name>(/...)? path.
+SKILL_PATH_RE = re.compile(r"^skills/([a-z][a-z0-9-]*)(?:/.*)?$", re.IGNORECASE)
+# Skip patterns (paths we won't bother scanning)
+SKIP_DIRS = (".git", "node_modules", "cold-storage", "archive", "quarantine", "daily-notes-archive")
+# Skip patterns at the file level — specific files whose entire purpose is
+# documenting broken-ref patterns (negative-example pedagogy). Without this,
+# the emitter false-positives on its own teaching material.
+# Match format: tuple of consecutive path segments from leaf-end.
+SKIP_FILE_PATH_SUFFIXES = (
+    ("skills", "workspace-audit", "references", "examples.md"),
+)
+
+KNOWN_SLUG_TOPS = (
+    "audits/", "memory/", "learning/", "wiki/", "reference/", "research/",
+    "decisions/", "skills/", "agents/", "templates/", "interview-prep-briefs/",
+    "interview-retrospectives/", "raw-sources/", "job-search/", "tasks/",
+)
+
+
+def should_skip(path: Path) -> bool:
+    parts_set = set(path.parts)
+    if any(s in parts_set for s in SKIP_DIRS):
+        return True
+    parts = path.parts
+    for suffix in SKIP_FILE_PATH_SUFFIXES:
+        if len(parts) >= len(suffix) and tuple(parts[-len(suffix):]) == suffix:
+            return True
+    return False
+
+
+def current_skills() -> set[str]:
+    """Include system skills, plugin skills, AND workspace-scoped skills."""
+    out = set()
+    for d in SKILL_DIRS:
+        if not d.exists():
+            continue
+        for sub in d.iterdir():
+            if sub.is_dir():
+                out.add(sub.name)
+    # Workspace-scoped skills (per-agent)
+    for ws in WORKSPACES:
+        ws_skills = ws / "skills"
+        if not ws_skills.exists():
+            continue
+        for sub in ws_skills.iterdir():
+            if sub.is_dir():
+                out.add(sub.name)
+    return out
+
+
+def current_agents() -> set[str]:
+    if not AGENT_DIR.exists():
+        return set()
+    return {p.name for p in AGENT_DIR.iterdir() if p.is_dir()}
+
+
+def looks_like_slug(path: str) -> bool:
+    if path.startswith(("http://", "https://", "mailto:", "/", "#", "?")):
+        return False
+    if "://" in path:
+        return False
+    # Strip fragment / query
+    p = path.split("#", 1)[0].split("?", 1)[0]
+    if not p:
+        return False
+    # Must have at least one slash (multi-segment) OR start with a known top
+    if "/" not in p:
+        return False
+    return any(p.startswith(top) for top in KNOWN_SLUG_TOPS)
+
+
+def resolve_local_slug(slug: str) -> bool:
+    """Try to find the slug as a workspace file (with/without .md)."""
+    candidates = [slug]
+    if not slug.endswith(".md"):
+        candidates.append(slug + ".md")
+        candidates.append(slug + "/README.md")
+    for ws in WORKSPACES:
+        for cand in candidates:
+            if (ws / cand).exists():
+                return True
+    return False
+
+
+def check_gbrain_slug(slug: str) -> bool:
+    """Try gbrain get_page. True if found."""
+    try:
+        p = subprocess.run([GBRAIN, "call", "get_page", json.dumps({"slug": slug})],
+                          capture_output=True, text=True, timeout=10)
+        if "Page not found" in (p.stdout + p.stderr):
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def workspace_agent(path: Path) -> str:
+    for ws in WORKSPACES:
+        try:
+            path.relative_to(ws)
+            name = ws.name
+            return name.replace("workspace-", "") if name != "workspace" else "main"
+        except ValueError:
+            continue
+    return "unknown"
+
+
+def emit_incident(title: str, agent: str, fields: dict, related: dict, body: str, dedup_key: str, dry_run: bool, severity: str = "low") -> tuple[bool, str]:
+    if dry_run:
+        return True, "(dry-run)"
+    cmd = [
+        INCIDENT_CLI, "emit",
+        "--source", "freshness",
+        "--severity", severity,
+        "--title", title,
+        "--agent", agent or "unknown",
+        "--key", dedup_key,
+        "--fields-json", json.dumps(fields),
+        "--related-json", json.dumps(related),
+    ]
+    p = subprocess.run(cmd, input=body, capture_output=True, text=True, timeout=30)
+    if p.returncode != 0:
+        return False, (p.stderr or p.stdout).strip()
+    return True, p.stdout.strip()
+
+
+# Dream-log rot detection — surfaces a distinct signal class.
+# Pattern: a memory/dreaming/{light,rem}/...md file references a memory/ path
+# that has been moved/archived. The archiver doesn't patch downstream dreams.
+DREAM_SOURCE_RE = re.compile(r"/memory/dreaming/(light|rem)/", re.IGNORECASE)
+
+
+def is_dream_source(path_str: str) -> bool:
+    return bool(DREAM_SOURCE_RE.search(path_str))
+
+
+def ref_targets_memory(ref: str) -> bool:
+    return ref.startswith("memory/") or "/memory/" in ref
+
+
+# Infra-rename rot detection — high-blast renames of core infra paths leave
+# references rotting across the workspace. Distinguish from generic broken-ref
+# noise by (1) target prefix and (2) blast radius (>5 occurrences).
+INFRA_RENAME_PREFIXES = (
+    "templates/",
+    "agents/handoffs/",
+    "agents/protocols/",
+    "skills/",
+)
+INFRA_RENAME_MIN_OCCURRENCES = 5
+
+
+def ref_targets_infra(ref: str) -> bool:
+    return any(ref.startswith(p) for p in INFRA_RENAME_PREFIXES)
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(prog="reference-rot-watch")
+    p.add_argument("--commit", action="store_true")
+    p.add_argument("--max", type=int, default=25)
+    p.add_argument("--check-gbrain", action="store_true", help="also validate slug links against gbrain (slower)")
+    p.add_argument("--verbose", "-v", action="store_true")
+    args = p.parse_args()
+
+    skills = current_skills()
+    agents = current_agents()
+    print(f"Registry: {len(skills)} skills, {len(agents)} agents")
+
+    rot: list[dict] = []
+    scanned = 0
+    gbrain_cache: dict[str, bool] = {}
+
+    for ws in WORKSPACES:
+        if not ws.exists():
+            continue
+        for f in ws.rglob("*.md"):
+            if should_skip(f):
+                continue
+            scanned += 1
+            try:
+                text = f.read_text(errors="replace")
+            except Exception:
+                continue
+
+            # Scan both markdown links and backtick code-spans.
+            def check_ref(ref: str, kind_hint: str, span_start: int, span_end: int) -> None:
+                clean = ref.split("#", 1)[0].split("?", 1)[0]
+                if not clean:
+                    return
+                # Skill ref?
+                sm = SKILL_PATH_RE.match(clean)
+                if sm:
+                    name = sm.group(1).lower()
+                    if name in skills:
+                        return
+                    rot.append({
+                        "file": str(f),
+                        "kind": f"skill-{kind_hint}",
+                        "ref": name,
+                        "context": text[max(0, span_start - 40): span_end + 40].replace("\n", " "),
+                    })
+                    return
+                # Slug-like ref
+                if not looks_like_slug(clean):
+                    return
+                if resolve_local_slug(clean):
+                    return
+                if args.check_gbrain:
+                    if clean not in gbrain_cache:
+                        gbrain_cache[clean] = check_gbrain_slug(clean)
+                    if gbrain_cache[clean]:
+                        return
+                rot.append({
+                    "file": str(f),
+                    "kind": f"slug-{kind_hint}",
+                    "ref": clean,
+                    "context": text[max(0, span_start - 40): span_end + 40].replace("\n", " "),
+                })
+
+            for m in MD_LINK_RE.finditer(text):
+                check_ref(m.group(1), "link", m.start(), m.end())
+            for m in BACKTICK_REF_RE.finditer(text):
+                check_ref(m.group(1), "backtick", m.start(), m.end())
+
+    # Filter literal placeholders (YYYY-MM-DD templates, <slug>, <name>, etc.)
+    PLACEHOLDER_TOKENS = ("YYYY", "MM-DD", "XXXX", "<", "{{", "$VAR")
+    def is_placeholder(ref: str) -> bool:
+        return any(tok in ref for tok in PLACEHOLDER_TOKENS)
+
+    rot_clean = [r for r in rot if not is_placeholder(r["ref"])]
+    n_placeholder = len(rot) - len(rot_clean)
+
+    # Group by ref-name — one incident per broken reference, listing files.
+    by_ref: dict[tuple, list[dict]] = {}
+    for r in rot_clean:
+        # Normalize kind: skill-link and skill-backtick → just "skill" for grouping
+        norm_kind = "skill" if r["kind"].startswith("skill-") else "slug"
+        key = (norm_kind, r["ref"])
+        by_ref.setdefault(key, []).append(r)
+
+    # Sort: most-referenced broken refs first (high signal)
+    grouped = sorted(by_ref.items(), key=lambda kv: -len(kv[1]))
+    capped = grouped[:args.max]
+
+    mode = "COMMIT" if args.commit else "DRY-RUN"
+    print(f"=== reference-rot-watch ({mode}) ===")
+    print(f"scanned: {scanned} files | rot candidates: {len(rot_clean)} raw refs, "
+          f"{len(grouped)} unique broken refs | filtered placeholders: {n_placeholder} | cap: {args.max}")
+    print()
+
+    emitted = 0
+    for (kind, ref), occurrences in capped:
+        # Pick the most-recently-edited file as the "primary" for agent/related
+        occurrences_sorted = sorted(occurrences, key=lambda o: -Path(o["file"]).stat().st_mtime
+                                    if Path(o["file"]).exists() else 0)
+        primary = occurrences_sorted[0]
+        primary_f = Path(primary["file"])
+        agent = workspace_agent(primary_f)
+        # Dream-log rot: dreaming/light or dreaming/rem source AND memory/ target.
+        dream_sources = [o["file"] for o in occurrences_sorted if is_dream_source(o["file"])]
+        is_dream_log_rot = bool(dream_sources) and ref_targets_memory(ref)
+        # Infra-rename rot: target is core infra path AND blast radius is high.
+        is_infra_rename_rot = (
+            ref_targets_infra(ref)
+            and len(occurrences) >= INFRA_RENAME_MIN_OCCURRENCES
+            and not is_dream_log_rot
+        )
+        if is_dream_log_rot:
+            title = f"Dream-log rot: {ref} unreachable from {len(dream_sources)} dreaming file(s)"
+            severity = "medium"
+        elif is_infra_rename_rot:
+            title = f"Infra-rename rot: {ref} stale across {len(occurrences)} files"
+            severity = "medium"
+        else:
+            title = f"Broken {kind} reference: {ref} ({len(occurrences)} file{'s' if len(occurrences) != 1 else ''})"
+            severity = "low"
+        fields = {
+            "kind": kind,
+            "ref": ref,
+            "occurrence_count": len(occurrences),
+            "primary_file": primary["file"],
+            "sample_context": primary["context"][:300],
+        }
+        if is_dream_log_rot:
+            fields["dream_log_rot"] = True
+            fields["dream_sources"] = dream_sources[:10]
+        if is_infra_rename_rot:
+            fields["infra_rename_rot"] = True
+        related = {"agent": agent, "all_files": [o["file"] for o in occurrences_sorted[:10]]}
+        body_lines = [
+            f"# Broken {kind} reference: `{ref}`",
+            f"appears in {len(occurrences)} file(s) but does not resolve in any current workspace/skill registry.",
+            "",
+            "## Files referencing it",
+        ]
+        for o in occurrences_sorted[:10]:
+            body_lines.append(f"- `{o['file']}`")
+            body_lines.append(f"    context: {o['context'][:200]}")
+        if len(occurrences) > 10:
+            body_lines.append(f"- ... and {len(occurrences) - 10} more")
+        body_lines += [
+            "",
+            "## Proposed action",
+            "Either update every reference to the correct path/name (file-patch each), OR mark the references obsolete (e.g. inline comment 'deprecated 2026-XX-XX'), OR archive the source files if they are themselves stale (file-archive).",
+        ]
+        dedup_key = f"freshness-ref-rot-{kind}-{ref}"
+        if args.verbose or not args.commit:
+            tag = ""
+            if is_dream_log_rot:
+                tag = "[DREAM-LOG-ROT]"
+            elif is_infra_rename_rot:
+                tag = "[INFRA-RENAME-ROT]"
+            print(f"  {kind.upper():5s} {ref!r:35s}  {len(occurrences)} file(s) {tag}")
+            if args.verbose:
+                for o in occurrences_sorted[:3]:
+                    print(f"          in {o['file']}")
+        if args.commit:
+            ok, msg = emit_incident(title, agent, fields, related, "\n".join(body_lines), dedup_key, dry_run=False, severity=severity)
+            if ok:
+                emitted += 1
+            else:
+                print(f"          WARN emit failed: {msg}", file=sys.stderr)
+
+    print()
+    n_skipped = max(0, len(grouped) - args.max)
+    total_occ_visible = sum(len(occ) for _, occ in capped)
+    print(f"emitted: {emitted} unique refs ({total_occ_visible} total occurrences) | "
+          f"skipped (cap): {n_skipped} refs")
+    if not args.commit:
+        print("(dry-run — no incidents emitted. Run with --commit to emit.)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

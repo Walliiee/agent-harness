@@ -1,0 +1,153 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+# Part of agent-harness (https://github.com/${GH_ORG}/agent-harness)
+#
+# qmd-sync — re-index and re-embed QMD across all configured agent silos.
+#
+# Closes the freshness gap discovered 2026-05-28: QMD had no scheduled
+# re-index, so wiki/memory writes were invisible to search until a manual
+# qmd run. Cron-driven via ai.openclaw.qmd-sync.plist (every 30 min,
+# 07:00–23:30 local).
+#
+# Per Unix exit convention (memory-promote pattern):
+#   exit 0  — all agents synced, or at least one agent partially succeeded
+#   exit 1  — every agent failed (hard failure)
+#
+# Usage:
+#   qmd-sync [--verbose] [--agent <name>] [--skip-embed]
+#
+set -u
+set -o pipefail
+
+OPENCLAW_HOME="${OPENCLAW_HOME:-$HOME/.openclaw}"
+
+# Agent set comes from config/agents.map (see resolution order below).
+# Each row is: <agent-id> <workspace-dir> <persona-label>. We only need the
+# agent-id (column 1) here, since that names the per-agent dir under agents/.
+AGENTS_MAP_FILE="${AGENTS_MAP:-}"
+if [ -z "$AGENTS_MAP_FILE" ] || [ ! -f "$AGENTS_MAP_FILE" ]; then
+  if [ -f "$OPENCLAW_HOME/config/agents.map" ]; then
+    AGENTS_MAP_FILE="$OPENCLAW_HOME/config/agents.map"
+  else
+    _self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    AGENTS_MAP_FILE="$_self_dir/../../config/agents.map"
+  fi
+fi
+
+read_agent_ids() {
+  if [ -f "$AGENTS_MAP_FILE" ]; then
+    grep -vE '^\s*#' "$AGENTS_MAP_FILE" | awk 'NF>=3 {print $1}'
+  else
+    printf 'main\ndev\n'
+  fi
+}
+
+declare -a AGENTS=()
+while IFS= read -r _aid; do
+  [ -n "$_aid" ] && AGENTS+=("$_aid")
+done < <(read_agent_ids)
+[ ${#AGENTS[@]} -eq 0 ] && AGENTS=(main dev)
+
+VERBOSE=0
+SKIP_EMBED=0
+ONLY_AGENT=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --verbose|-v) VERBOSE=1; shift ;;
+    --skip-embed) SKIP_EMBED=1; shift ;;
+    --agent) ONLY_AGENT="$2"; shift 2 ;;
+    -h|--help)
+      sed -n '5,18p' "$0"; exit 0 ;;
+    *) echo "qmd-sync: unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+log() { printf '[qmd-sync] %s\n' "$*"; }
+vlog() { [ "$VERBOSE" -eq 1 ] && printf '[qmd-sync] %s\n' "$*"; return 0; }
+
+QMD_BIN="$(command -v qmd 2>/dev/null || true)"
+if [ -z "$QMD_BIN" ]; then
+  # shells may have qmd as alias only; fall back to default homebrew path
+  for c in /opt/homebrew/bin/qmd /usr/local/bin/qmd "$HOME/.local/bin/qmd"; do
+    [ -x "$c" ] && QMD_BIN="$c" && break
+  done
+fi
+if [ -z "$QMD_BIN" ]; then
+  log "ERROR: qmd binary not found in PATH"
+  exit 1
+fi
+vlog "using qmd: $QMD_BIN"
+
+run_agent() {
+  local agent="$1"
+  local cfg="$OPENCLAW_HOME/agents/$agent/qmd/xdg-config"
+  local cache="$OPENCLAW_HOME/agents/$agent/qmd/xdg-cache"
+
+  if [ ! -d "$cfg" ]; then
+    log "skip $agent (no xdg-config at $cfg)"
+    return 2  # treat as skip, not failure
+  fi
+
+  local rc_update=0 rc_embed=0
+  local t0 t1
+
+  t0=$(date +%s)
+  if [ "$VERBOSE" -eq 1 ]; then
+    XDG_CONFIG_HOME="$cfg" XDG_CACHE_HOME="$cache" "$QMD_BIN" update
+    rc_update=$?
+  else
+    XDG_CONFIG_HOME="$cfg" XDG_CACHE_HOME="$cache" "$QMD_BIN" update >/dev/null 2>&1
+    rc_update=$?
+  fi
+  t1=$(date +%s)
+  vlog "$agent: update rc=$rc_update ($((t1 - t0))s)"
+
+  if [ "$SKIP_EMBED" -eq 0 ]; then
+    t0=$(date +%s)
+    if [ "$VERBOSE" -eq 1 ]; then
+      XDG_CONFIG_HOME="$cfg" XDG_CACHE_HOME="$cache" "$QMD_BIN" embed
+      rc_embed=$?
+    else
+      XDG_CONFIG_HOME="$cfg" XDG_CACHE_HOME="$cache" "$QMD_BIN" embed >/dev/null 2>&1
+      rc_embed=$?
+    fi
+    t1=$(date +%s)
+    vlog "$agent: embed rc=$rc_embed ($((t1 - t0))s)"
+  fi
+
+  if [ $rc_update -eq 0 ] && [ $rc_embed -eq 0 ]; then
+    return 0
+  fi
+  return 1
+}
+
+ok=0
+failed=0
+skipped=0
+declare -a OK_LIST=() FAIL_LIST=() SKIP_LIST=()
+
+for agent in "${AGENTS[@]}"; do
+  if [ -n "$ONLY_AGENT" ] && [ "$ONLY_AGENT" != "$agent" ]; then
+    continue
+  fi
+  run_agent "$agent"
+  rc=$?
+  case $rc in
+    0) ok=$((ok+1)); OK_LIST+=("$agent") ;;
+    2) skipped=$((skipped+1)); SKIP_LIST+=("$agent") ;;
+    *) failed=$((failed+1)); FAIL_LIST+=("$agent") ;;
+  esac
+done
+
+summary="ok=$ok failed=$failed skipped=$skipped"
+[ ${#OK_LIST[@]} -gt 0 ] && summary="$summary ok=[${OK_LIST[*]}]"
+[ ${#FAIL_LIST[@]} -gt 0 ] && summary="$summary failed=[${FAIL_LIST[*]}]"
+[ ${#SKIP_LIST[@]} -gt 0 ] && summary="$summary skipped=[${SKIP_LIST[*]}]"
+log "$summary"
+
+# Unix convention: partial success → 0, total failure → 1
+if [ $ok -gt 0 ] || [ $failed -eq 0 ]; then
+  exit 0
+fi
+exit 1

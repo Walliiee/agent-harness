@@ -1,0 +1,18 @@
+{
+  "_comment": "Authoritative declaration of gbrain source -> local_path mapping. Drift between this file and the live `sources` table in Postgres is what gbrain-sources-doctor detects. Refresh the ground-truth comment whenever you reconcile the manifest against the DB.",
+  "_purpose": "Prevent silent recurrence of the class of misconfig where a source is registered with the wrong local_path (e.g. the default source pointing at a sibling agent's workspace). No `gbrain sources update` CLI exists; only direct SQL can change local_path; therefore only a declarative cross-check can catch drift.",
+  "_federation_note": "In this 2-agent example, default+dev are federated (the orchestrator's query view spans them). Isolated sources (per-agent views only) would set federation_role=isolated and live under a path-isolated tree to keep their content from bleeding into federated queries. Any agent intentionally excluded from gbrain must be ABSENT here; if it appears in the live sources table, that is MISSING_IN_MANIFEST drift. Federation is enforced at query time, not by local_path.",
+  "sources": {
+    "default": {
+      "local_path": "${OPENCLAW_HOME}/workspace",
+      "federation_role": "federated",
+      "owner_agent": "main",
+      "note": "Main orchestrator workspace. THIS local_path is the value drift detection must defend — a rebuild that bakes the wrong path here silently mixes another agent's content into federated queries."
+    },
+    "dev": {
+      "local_path": "${OPENCLAW_HOME}/workspace-dev",
+      "federation_role": "federated",
+      "owner_agent": "dev"
+    }
+  }
+}

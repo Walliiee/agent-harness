@@ -1,0 +1,57 @@
+# workspaces.manifest.yaml — authoritative list of GitHub repos that compose
+# your OpenClaw setup. Used by restore-workspaces.sh on a fresh machine.
+#
+# Each component clones directly from its own remote into its canonical
+# on-disk path. restore-workspaces.sh iterates this list.
+#
+# Replace ${GH_ORG} with your GitHub org/user. Paths use $HOME so they
+# resolve on any machine. This template ships a main+dev example set —
+# add more agents by appending entries under `workspaces:` (one per repo).
+#
+# Cadence: the DR walker (claw-sync-all.sh) pushes these on its schedule
+# (the orchestrator workspace may use its own QMD-enabled sync).
+
+workspaces:
+  # --- Agent workspaces -----------------------------------------------------
+
+  - role: main-workspace
+    url: https://github.com/${GH_ORG}/main-memory.git
+    path: ~/.openclaw/workspace
+    note: Main orchestrator agent. QMD-enabled.
+
+  - role: dev-workspace
+    url: https://github.com/${GH_ORG}/dev.git
+    path: ~/.openclaw/workspace-dev
+    note: Developer agent.
+
+  # --- To add another agent, copy the block above and adjust role/url/path:
+  # - role: research-workspace
+  #   url: https://github.com/${GH_ORG}/research.git
+  #   path: ~/.openclaw/workspace-research
+  #   note: Research agent.
+
+  # --- Shared infrastructure ------------------------------------------------
+
+  - role: shared-skills
+    url: https://github.com/${GH_ORG}/shared-skills.git
+    path: ~/.openclaw/skills
+    note: Shared skill bundle used by all agents.
+
+  - role: gbrain-backups
+    url: https://github.com/${GH_ORG}/gbrain-backups.git
+    path: ~/.gbrain-backups
+    note: |
+      Off-machine pg-dump snapshots. Pushed on a schedule by a backups-push
+      LaunchAgent. Used by restore-gbrain.sh.
+
+# Notes on what is NOT in this manifest:
+#
+#   - gbrain config (~/.gbrain/) is mirrored INTO the DR repo by
+#     claw-sync-all.sh. restore-gbrain.sh copies it back out. No separate
+#     GitHub repo needed.
+#
+#   - Per-agent tools that live inside an agent workspace ride along with
+#     that workspace's repo — no separate entry needed.
+#
+#   - The gbrain source codebase itself is reinstalled fresh on a new
+#     machine; only its local config is restored from the DR mirror.

@@ -1,0 +1,247 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Part of agent-harness (https://github.com/${GH_ORG}/agent-harness)
+"""qmd-prune — purge orphan-collection docs and vanished-file docs from QMD indices.
+
+Each agent has its own QMD store at:
+  ~/.openclaw/agents/<agent>/qmd/xdg-cache/qmd/index.sqlite
+
+Two classes of stale state accumulate:
+  1. orphan-collection-docs: documents.collection name no longer present in
+     store_collections (collection was renamed/removed via index.yml edit;
+     `qmd update` doesn't sweep these because it only walks live collections).
+  2. vanished-file-docs: documents.path no longer exists on disk (file was
+     moved/deleted and `qmd update` somehow missed it — rare but happens).
+
+QMD's own `qmd cleanup` flushes orphan vector chunks, and `qmd collection
+remove` requires the collection to still be registered. Neither covers the
+two cases above; this script is the gap-filler.
+
+After deleting documents rows, runs `qmd cleanup` per agent to let QMD prune
+the now-orphan content + vector entries through its own sanctioned path.
+
+Usage:
+  qmd-prune                     # dry-run report across all configured agents
+  qmd-prune --apply             # actually delete
+  qmd-prune --agent main        # scope to one agent
+  qmd-prune --json              # machine-readable report
+
+Exit codes:
+  0 — clean (no stale state found) OR --apply succeeded
+  1 — stale state found in dry-run mode
+  2 — error
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import sqlite3
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
+
+OPENCLAW_HOME = Path(os.environ.get("OPENCLAW_HOME", os.path.expanduser("~/.openclaw")))
+
+
+def _load_agents_map():
+    """Return list of (agent_id, workspace_dir, persona) from config/agents.map."""
+    here = Path(__file__).resolve()
+    candidates = []
+    env_map = os.environ.get("AGENTS_MAP")
+    if env_map:
+        candidates.append(Path(env_map))
+    candidates.append(OPENCLAW_HOME / "config" / "agents.map")
+    candidates.append(here.parent.parent.parent / "config" / "agents.map")
+    for c in candidates:
+        try:
+            if c.is_file():
+                rows = []
+                for line in c.read_text(encoding="utf-8").splitlines():
+                    line = line.split("#", 1)[0].strip()
+                    if not line:
+                        continue
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        rows.append((parts[0], parts[1], parts[2]))
+                if rows:
+                    return rows
+        except OSError:
+            continue
+    return [("main", "workspace", "Orchestrator"), ("dev", "workspace-dev", "Developer")]
+
+
+AGENTS = [aid for aid, _ws, _p in _load_agents_map()]
+
+
+def agent_db(agent: str) -> Path:
+    return OPENCLAW_HOME / "agents" / agent / "qmd" / "xdg-cache" / "qmd" / "index.sqlite"
+
+
+def agent_xdg_env(agent: str) -> dict[str, str]:
+    return {
+        **os.environ,
+        "XDG_CONFIG_HOME": str(OPENCLAW_HOME / "agents" / agent / "qmd" / "xdg-config"),
+        "XDG_CACHE_HOME": str(OPENCLAW_HOME / "agents" / agent / "qmd" / "xdg-cache"),
+    }
+
+
+def scan_agent(agent: str) -> dict:
+    """Return per-agent stale-state breakdown."""
+    db = agent_db(agent)
+    if not db.exists():
+        return {"agent": agent, "skipped": "no-db"}
+    con = sqlite3.connect(str(db))
+    cur = con.cursor()
+
+    cur.execute("SELECT COUNT(*) FROM documents WHERE active=1")
+    total_active = cur.fetchone()[0]
+
+    cur.execute(
+        "SELECT d.collection, COUNT(*) FROM documents d "
+        "LEFT JOIN store_collections c ON d.collection=c.name "
+        "WHERE c.name IS NULL AND d.active=1 "
+        "GROUP BY d.collection ORDER BY COUNT(*) DESC"
+    )
+    orphan_collections = cur.fetchall()
+    orphan_total = sum(n for _, n in orphan_collections)
+
+    cur.execute(
+        "SELECT c.path, d.collection, d.path FROM documents d "
+        "JOIN store_collections c ON d.collection=c.name "
+        "WHERE d.active=1"
+    )
+    vanished = []
+    for root, coll, rel in cur.fetchall():
+        absolute = Path(root) / rel
+        if not absolute.exists():
+            vanished.append({"collection": coll, "path": rel, "absolute": str(absolute)})
+
+    con.close()
+    return {
+        "agent": agent,
+        "total_active": total_active,
+        "orphan_collections": [{"name": n, "docs": c} for n, c in orphan_collections],
+        "orphan_total": orphan_total,
+        "vanished": vanished,
+        "vanished_count": len(vanished),
+    }
+
+
+def apply_agent(agent: str, report: dict) -> dict:
+    """Delete the stale rows + run qmd cleanup. Returns outcome dict."""
+    db = agent_db(agent)
+    backup = db.with_suffix(f".sqlite.bak-{datetime.now().strftime('%Y%m%d-%H%M%S')}")
+    shutil.copy2(db, backup)
+
+    con = sqlite3.connect(str(db))
+    cur = con.cursor()
+
+    orphan_deleted = 0
+    if report["orphan_collections"]:
+        names = [c["name"] for c in report["orphan_collections"]]
+        placeholders = ",".join("?" * len(names))
+        cur.execute(
+            f"DELETE FROM documents WHERE collection IN ({placeholders}) AND active=1",
+            names,
+        )
+        orphan_deleted = cur.rowcount
+
+    vanished_deleted = 0
+    for v in report["vanished"]:
+        cur.execute(
+            "DELETE FROM documents WHERE collection=? AND path=? AND active=1",
+            (v["collection"], v["path"]),
+        )
+        vanished_deleted += cur.rowcount
+
+    con.commit()
+    con.close()
+
+    cleanup = subprocess.run(
+        ["qmd", "cleanup"],
+        env=agent_xdg_env(agent),
+        capture_output=True, text=True, timeout=60,
+    )
+    return {
+        "backup": str(backup),
+        "orphan_docs_deleted": orphan_deleted,
+        "vanished_docs_deleted": vanished_deleted,
+        "qmd_cleanup_stdout": cleanup.stdout.strip(),
+        "qmd_cleanup_returncode": cleanup.returncode,
+    }
+
+
+def format_report(reports: list[dict], applied: dict[str, dict] | None) -> str:
+    lines = []
+    total_orphan = 0
+    total_vanished = 0
+    for r in reports:
+        if r.get("skipped"):
+            lines.append(f"{r['agent']:15s} : SKIPPED ({r['skipped']})")
+            continue
+        lines.append(
+            f"{r['agent']:15s} : {r['total_active']:5d} active, "
+            f"{r['orphan_total']:4d} orphan-collection, "
+            f"{r['vanished_count']:3d} vanished-file"
+        )
+        total_orphan += r["orphan_total"]
+        total_vanished += r["vanished_count"]
+        if r["orphan_collections"]:
+            for c in r["orphan_collections"]:
+                lines.append(f"  - orphan collection: {c['name']:35s} {c['docs']:4d} docs")
+        for v in r["vanished"]:
+            lines.append(f"  - vanished file: {v['absolute']}")
+        if applied and r["agent"] in applied:
+            a = applied[r["agent"]]
+            lines.append(
+                f"  → APPLIED: orphan_docs_deleted={a['orphan_docs_deleted']} "
+                f"vanished_docs_deleted={a['vanished_docs_deleted']} "
+                f"qmd_cleanup_rc={a['qmd_cleanup_returncode']}"
+            )
+            lines.append(f"    backup: {a['backup']}")
+            if a["qmd_cleanup_stdout"]:
+                for cl in a["qmd_cleanup_stdout"].splitlines():
+                    lines.append(f"    qmd cleanup: {cl}")
+    lines.append("")
+    lines.append(f"TOTAL: {total_orphan} orphan-collection docs, {total_vanished} vanished-file docs")
+    return "\n".join(lines)
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(prog="qmd-prune")
+    p.add_argument("--agent", choices=AGENTS, help="scope to one agent (default: all)")
+    p.add_argument("--apply", action="store_true", help="actually delete; default is dry-run")
+    p.add_argument("--json", action="store_true", help="machine-readable output")
+    args = p.parse_args()
+
+    targets = [args.agent] if args.agent else AGENTS
+    reports = [scan_agent(a) for a in targets]
+    total_stale = sum(
+        r.get("orphan_total", 0) + r.get("vanished_count", 0) for r in reports
+    )
+
+    applied = None
+    if args.apply and total_stale > 0:
+        applied = {}
+        for r in reports:
+            if r.get("skipped"):
+                continue
+            if r["orphan_total"] == 0 and r["vanished_count"] == 0:
+                continue
+            applied[r["agent"]] = apply_agent(r["agent"], r)
+
+    if args.json:
+        print(json.dumps({"reports": reports, "applied": applied}, indent=2))
+    else:
+        print(format_report(reports, applied))
+
+    if args.apply:
+        return 0
+    return 1 if total_stale > 0 else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

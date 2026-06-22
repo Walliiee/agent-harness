@@ -1,0 +1,156 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Part of agent-harness (https://github.com/${GH_ORG}/agent-harness)
+"""gbrain-prune — soft-delete gbrain pages whose backing file no longer exists.
+
+Mirror of `qmd-prune` for gbrain. Walks every source with a `local_path`,
+joins to active (non-deleted) pages, reconstructs the expected file path
+(`local_path + slug + ".md"`), and flags pages whose file is missing on
+disk.
+
+Default mode is dry-run report. `--apply` calls `gbrain delete <slug>` per
+vanished page — gbrain's soft-delete gives a 72h restore window (via
+`restore_page`), which is the built-in rollback so no separate pg_dump is
+needed.
+
+Sources are defined per-brain by their gbrain source config; each source with
+a `local_path` is scanned. Typical layout:
+  default      → ${OPENCLAW_HOME}/workspace
+  dev          → ${OPENCLAW_HOME}/workspace-dev
+  (additional sources resolve to their configured local_path)
+
+Usage:
+  gbrain-prune                     # dry-run report across all sources
+  gbrain-prune --apply             # soft-delete vanished pages
+  gbrain-prune --source default    # scope to one source
+  gbrain-prune --json              # machine-readable
+
+Exit codes (mirror qmd-prune):
+  0 — clean OR --apply completed
+  1 — stale state found in dry-run mode
+  2 — error
+"""
+from __future__ import annotations
+
+import argparse
+import collections
+import json
+import os
+import subprocess
+import sys
+
+PSQL_URL = "postgresql://gbrain@localhost:5432/gbrain"
+GBRAIN_BIN = os.environ.get("GBRAIN_BIN", os.path.expanduser("~/.bun/bin/gbrain"))
+
+
+def fetch_pages(source_filter: str | None = None) -> list[tuple[str, str, str]]:
+    """Return list of (source_id, local_path, slug) for all live pages."""
+    where = "WHERE p.deleted_at IS NULL AND s.local_path IS NOT NULL AND s.archived = false"
+    if source_filter:
+        where += f" AND p.source_id = '{source_filter}'"
+    sql = (
+        "SELECT p.source_id, s.local_path, p.slug "
+        "FROM pages p JOIN sources s ON s.id = p.source_id " + where + ";"
+    )
+    r = subprocess.run(
+        ["psql", PSQL_URL, "-At", "-F", "|", "-c", sql],
+        capture_output=True, text=True, check=False,
+    )
+    if r.returncode != 0:
+        print(f"error: psql failed: {r.stderr}", file=sys.stderr)
+        sys.exit(2)
+    rows = []
+    for line in r.stdout.strip().split("\n"):
+        if not line:
+            continue
+        parts = line.split("|", 2)
+        if len(parts) == 3:
+            rows.append(tuple(parts))
+    return rows
+
+
+def scan(source_filter: str | None) -> dict:
+    rows = fetch_pages(source_filter)
+    per_source_total = collections.Counter()
+    per_source_missing = collections.defaultdict(list)
+    for source_id, local_path, slug in rows:
+        per_source_total[source_id] += 1
+        abs_path = os.path.join(local_path, slug + ".md")
+        if not os.path.isfile(abs_path):
+            per_source_missing[source_id].append({"slug": slug, "expected_path": abs_path})
+
+    return {
+        "per_source_total": dict(per_source_total),
+        "per_source_missing": {k: v for k, v in per_source_missing.items()},
+        "grand_total_missing": sum(len(v) for v in per_source_missing.values()),
+    }
+
+
+def apply_one(slug: str) -> tuple[bool, str]:
+    """Run `gbrain delete <slug>`; return (ok, output)."""
+    r = subprocess.run(
+        [GBRAIN_BIN, "delete", slug],
+        capture_output=True, text=True, timeout=30,
+    )
+    out = (r.stdout + r.stderr).strip()
+    return r.returncode == 0, out
+
+
+def format_report(report: dict, applied: dict[str, list[dict]] | None) -> str:
+    lines = []
+    sources = sorted(report["per_source_total"].keys())
+    for src in sources:
+        total = report["per_source_total"][src]
+        missing = report["per_source_missing"].get(src, [])
+        lines.append(f"{src:30s} : {total:5d} live pages, {len(missing):4d} vanished-file")
+        for i, m in enumerate(missing[:5]):
+            lines.append(f"  - vanished: {m['slug']}  (no file at {m['expected_path']})")
+        if len(missing) > 5:
+            lines.append(f"  - ... and {len(missing) - 5} more")
+        if applied and src in applied:
+            ok = sum(1 for r in applied[src] if r["ok"])
+            fail = sum(1 for r in applied[src] if not r["ok"])
+            lines.append(f"  → APPLIED: {ok} soft-deleted, {fail} failed (72h restore window per page)")
+            for r in applied[src]:
+                if not r["ok"]:
+                    lines.append(f"    FAIL: {r['slug']}: {r['output'][:120]}")
+    lines.append("")
+    lines.append(f"TOTAL vanished-file pages: {report['grand_total_missing']}")
+    return "\n".join(lines)
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(prog="gbrain-prune")
+    p.add_argument("--source", help="scope to one source id (default: all)")
+    p.add_argument("--apply", action="store_true", help="actually soft-delete via `gbrain delete`")
+    p.add_argument("--json", action="store_true", help="machine-readable output")
+    p.add_argument("--limit", type=int, default=None, help="cap applied deletions for safety (default: unlimited)")
+    args = p.parse_args()
+
+    report = scan(args.source)
+    applied = None
+    if args.apply and report["grand_total_missing"] > 0:
+        applied = collections.defaultdict(list)
+        count = 0
+        for src, missing_list in report["per_source_missing"].items():
+            for m in missing_list:
+                if args.limit is not None and count >= args.limit:
+                    break
+                ok, output = apply_one(m["slug"])
+                applied[src].append({"slug": m["slug"], "ok": ok, "output": output})
+                count += 1
+            if args.limit is not None and count >= args.limit:
+                break
+
+    if args.json:
+        print(json.dumps({"report": report, "applied": dict(applied) if applied else None}, indent=2))
+    else:
+        print(format_report(report, dict(applied) if applied else None))
+
+    if args.apply:
+        return 0
+    return 1 if report["grand_total_missing"] > 0 else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

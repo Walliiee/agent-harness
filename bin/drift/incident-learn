@@ -1,0 +1,572 @@
+#!/usr/bin/env python3
+"""Drift incident compound learner (phase 4).
+
+Reads incidents in a window (default 30 days), groups by `type`, and for each
+group with at least N incidents calls an LLM to distill a structured learnings
+doc into `~/.openclaw/incidents/learnings/<type>.md`.
+
+These learnings are loaded back by `incident-analyze` to ground future
+analyses, closing the compound loop.
+
+The `--propose-patches` mode reads existing `learnings/*.md` files and emits
+per-candidate proposal artifacts to `~/.openclaw/incidents/proposals/`, so
+"Detector candidates" stop dead-ending in a markdown bullet and become
+reviewable items. Each proposal has its own frontmatter and `status: proposed`
+flow (proposed → applied | wontfix | obsolete).
+
+Usage:
+  incident-learn                          # distill all types meeting threshold
+  incident-learn --type model-timeout     # one type only
+  incident-learn --window-days 14         # narrower window
+  incident-learn --min-incidents 3        # raise threshold
+  incident-learn --dry-run                # print to stdout, don't write
+  incident-learn --propose-patches        # read learnings/, emit proposals/
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+ROOT = Path(os.environ.get("OPENCLAW_INCIDENTS_DIR", str(Path.home() / ".openclaw" / "incidents")))
+LEARNINGS_DIR = ROOT / "learnings"
+PROPOSALS_DIR = ROOT / "proposals"
+OPENCLAW = os.environ.get("OPENCLAW_BIN", "openclaw")
+MODEL = os.environ.get("DRIFT_LEARN_MODEL", os.environ.get("DRIFT_ANALYZER_MODEL", "ollama/glm-5.1:cloud"))
+TIMEOUT_S = int(os.environ.get("DRIFT_LEARN_TIMEOUT", "180"))
+
+FRONTMATTER_RE = re.compile(r"^---\n(.*?)\n---\n(.*)$", re.DOTALL)
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# ---------- frontmatter I/O (shared shape with incident-analyze) ----------
+
+def parse_frontmatter(text: str) -> tuple[dict, str]:
+    m = FRONTMATTER_RE.match(text)
+    if not m:
+        raise ValueError("missing frontmatter")
+    fm_text, body = m.group(1), m.group(2)
+    fm: dict = {}
+    for raw_line in fm_text.split("\n"):
+        if not raw_line.strip() or raw_line.startswith(" "):
+            continue
+        if ":" not in raw_line:
+            continue
+        k, _, v = raw_line.partition(":")
+        k, v = k.strip(), v.strip()
+        fm[k] = _scalar(v)
+    return fm, body
+
+
+def _scalar(v: str):
+    if v in ("null", "~", ""):
+        return None
+    if v == "true":
+        return True
+    if v == "false":
+        return False
+    if v.startswith('"') and v.endswith('"'):
+        try:
+            return json.loads(v)
+        except json.JSONDecodeError:
+            return v[1:-1]
+    if v.startswith("{") or v.startswith("["):
+        try:
+            return json.loads(v)
+        except json.JSONDecodeError:
+            return v
+    try:
+        return int(v)
+    except ValueError:
+        pass
+    try:
+        return float(v)
+    except ValueError:
+        pass
+    return v
+
+
+# ---------- incident loading ----------
+
+def iter_incidents() -> list[Path]:
+    out = []
+    if not ROOT.exists():
+        return out
+    for day in sorted(ROOT.iterdir()):
+        if not day.is_dir() or not re.match(r"\d{4}-\d{2}-\d{2}", day.name):
+            continue
+        out.extend(sorted(day.glob("*.md")))
+    return out
+
+
+def within_window(fm: dict, since: datetime) -> bool:
+    det = fm.get("detected_at")
+    if not det or not isinstance(det, str):
+        return True  # don't filter what we can't parse
+    try:
+        dt = datetime.fromisoformat(det.replace("Z", "+00:00"))
+    except Exception:
+        return True
+    return dt >= since
+
+
+def compact_incident(fm: dict, body: str) -> dict:
+    """Strip an incident down to the fields useful for distillation."""
+    out = {
+        "id": fm.get("id"),
+        "type": fm.get("type"),
+        "source": fm.get("source"),
+        "agent": fm.get("agent"),
+        "title": fm.get("title"),
+        "severity": fm.get("severity"),
+        "detected_at": fm.get("detected_at"),
+        "status": fm.get("status"),
+        "confidence": fm.get("confidence"),
+        "fields": fm.get("fields"),
+    }
+    pf = fm.get("proposed_fix") or {}
+    if isinstance(pf, dict):
+        opts = pf.get("options") or []
+        out["proposal"] = {
+            "type": pf.get("type"),
+            "recommended": pf.get("recommended"),
+            "options": [{
+                "label": o.get("label"),
+                "fix_kind": o.get("fix_kind"),
+                "risk": o.get("risk"),
+                "summary": o.get("summary"),
+                "auto_safe": o.get("auto_safe"),
+            } for o in opts],
+        }
+    # Outcome telemetry from frontmatter + body
+    out["outcome"] = {
+        "decided_choice": fm.get("decided_choice"),
+        "decided_by": fm.get("decided_by"),
+        "applied_by": fm.get("applied_by"),
+        "reverted_at": fm.get("reverted_at"),
+    }
+    return out
+
+
+# ---------- LLM call ----------
+
+def call_model(prompt: str) -> str:
+    cmd = [OPENCLAW, "infer", "model", "run", "--model", MODEL, "--thinking", "off", "--prompt", prompt, "--json"]
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=TIMEOUT_S)
+    if p.returncode != 0:
+        raise RuntimeError(f"model call failed: {p.stderr.strip() or p.stdout.strip()}")
+    envelope = json.loads(p.stdout)
+    text = (envelope.get("outputs") or [{}])[0].get("text", "")
+    text = re.sub(r"^```(?:markdown|md)?\s*", "", text.strip())
+    text = re.sub(r"\s*```$", "", text.strip())
+    return text.strip()
+
+
+PROMPT_TEMPLATE = """You distill OpenClaw drift incidents into compound learnings.
+
+You will be given all incidents of one type (e.g. model-timeout, file-edit-mismatch) from the last {window_days} days.
+Produce a SHORT, OPERATIONAL Markdown document for a busy operator.
+
+Audience: future runs of `incident-analyze` will load this file to ground their proposals, and a human will skim it weekly. Brevity beats completeness.
+
+TYPE: {type}
+INCIDENT COUNT: {n}
+
+INCIDENTS (JSON array, compact):
+{incidents_json}
+
+Produce ONLY the Markdown body (no fences, no preamble). Structure:
+
+# Learnings: {type}
+
+## Cluster summary
+<one short paragraph: what pattern dominates this type — agent? cron? error excerpt? Use named entities (cron name, agent ids, model strings) where present in the data.>
+
+## Top patterns
+<bulleted list, max 5. Each bullet: "<pattern>: <N incidents> — <one-clause observation>". Order by incident count.>
+
+## Fix recipes (ordered by evidence)
+<bulleted list of fix recipes that have been APPLIED with outcome. Each: "<concrete recipe>: applied <N>×, reverted <M>×". Skip recipes that were only proposed but never applied. If no recipes have evidence yet, write "(none with applied evidence yet)".>
+
+## Signals to watch
+<2-4 bullets. Operational guidance for what a human or analyzer should notice next time. Specific, not generic. Skip if nothing useful.>
+
+## Detector candidates
+<0-3 bullets. Patterns that might warrant a new emitter or a higher-severity rule. Each: "<one-line candidate>: <why>". This is for HUMAN review — nothing is auto-spawned. Skip the section entirely if no candidates.>
+
+Rules:
+- Be terse. No filler. No restating what the type means.
+- Quote specific named entities (agent ids, cron names, model strings, error excerpts) from the data.
+- If a section has nothing useful to say, write "(none)" — do not pad.
+- Output only the Markdown. No code fences. No extra text.
+"""
+
+
+def distill(itype: str, incidents: list[dict], window_days: int) -> str:
+    compact = [compact_incident(i["fm"], i["body"]) for i in incidents]
+    prompt = PROMPT_TEMPLATE.format(
+        window_days=window_days,
+        type=itype,
+        n=len(incidents),
+        incidents_json=json.dumps(compact, indent=2)[:30000],  # cap context
+    )
+    return call_model(prompt)
+
+
+# ---------- write learning ----------
+
+def write_learning(itype: str, n: int, window_days: int, body: str) -> Path:
+    LEARNINGS_DIR.mkdir(parents=True, exist_ok=True)
+    safe = re.sub(r"[^a-zA-Z0-9_-]", "-", itype)
+    path = LEARNINGS_DIR / f"{safe}.md"
+    fm_lines = [
+        "---",
+        f"type: {itype}",
+        f"window_days: {window_days}",
+        f"incidents_analyzed: {n}",
+        f"last_updated: {now_iso()}",
+        f"analyzer_model: {MODEL}",
+        "---",
+    ]
+    path.write_text("\n".join(fm_lines) + "\n\n" + body.strip() + "\n")
+    return path
+
+
+# ---------- propose-patches mode ----------
+
+PROPOSE_PROMPT_TEMPLATE = """You convert "Detector candidates" from a drift learnings doc into structured patch proposals for human review.
+
+Focus on the `## Detector candidates` section, but use the rest of the doc as supporting evidence. Each detector candidate becomes ONE proposal. Do NOT invent candidates that aren't in the doc.
+
+DRIFT TYPE: {type}
+
+LEARNINGS DOC:
+{learning_body}
+
+ALREADY-PROPOSED titles for this type (do NOT re-emit semantically equivalent proposals; treat these as already covered):
+{existing_titles}
+
+Produce a JSON envelope and nothing else:
+
+{{
+  "proposals": [
+    {{
+      "slug": "short-kebab-case-id-max-40-chars",
+      "title": "one-line title, max 80 chars",
+      "kind": "new_emitter | modify_emitter | severity_rule | model_ban_rule | skill_patch | infrastructure | other",
+      "rationale": "2-3 sentences citing SPECIFIC evidence from the doc (incident counts, model names, agents, cron names, error excerpts). No filler.",
+      "patch_sketch": "concrete proposed change. Name the likely file/skill/emitter to touch if you can infer it. 1-3 sentences. No speculative refactors.",
+      "target_hint": "optional file path or skill slug where this likely lives. Omit field if unknown.",
+      "evidence": {{
+        "incident_count": <int from the doc>,
+        "confidence": "low | medium | high"
+      }}
+    }}
+  ]
+}}
+
+Rules:
+- One proposal per detector candidate. If the section is empty, "(none)", or missing, return {{"proposals": []}}.
+- Slugs must be unique within this batch and look like `model-edit-ban`, `log-rot-emitter`, etc.
+- Confidence: "high" if ≥3 supporting incidents AND a clear pattern; "medium" if 2 incidents or weak pattern; "low" otherwise.
+- Cite named entities verbatim from the doc (cron names, model strings, chat_ids).
+- Output ONLY JSON. No code fences. No preamble.
+"""
+
+
+def slugify(s: str, maxlen: int = 50) -> str:
+    s = re.sub(r"[^a-zA-Z0-9_-]+", "-", (s or "").lower()).strip("-")
+    s = re.sub(r"-+", "-", s)
+    return s[:maxlen].rstrip("-")
+
+
+def extract_detector_candidates(body: str) -> str:
+    m = re.search(r"##\s*Detector candidates\s*\n(.*?)(?=\n##\s|\Z)", body, re.DOTALL | re.IGNORECASE)
+    if not m:
+        return ""
+    return m.group(1).strip()
+
+
+def existing_proposal_titles(itype: str) -> list[str]:
+    """Titles of non-obsolete proposals, for in-prompt dedup."""
+    out: list[str] = []
+    if not PROPOSALS_DIR.exists():
+        return out
+    safe_type = re.sub(r"[^a-zA-Z0-9_-]", "-", itype)
+    for f in sorted(PROPOSALS_DIR.glob(f"{safe_type}-*.md")):
+        try:
+            fm, _ = parse_frontmatter(f.read_text())
+        except Exception:
+            continue
+        if fm.get("status") == "obsolete":
+            continue
+        t = fm.get("title")
+        if t:
+            out.append(t)
+    return out
+
+
+def call_propose_model(itype: str, body: str) -> list[dict]:
+    titles = existing_proposal_titles(itype)
+    existing_block = (
+        "\n".join(f"- {t}" for t in titles) if titles else "(none — first run for this type)"
+    )
+    prompt = PROPOSE_PROMPT_TEMPLATE.format(
+        type=itype,
+        learning_body=body[:15000],
+        existing_titles=existing_block,
+    )
+    raw = call_model(prompt)
+    raw = re.sub(r"^```(?:json)?\s*", "", raw.strip())
+    raw = re.sub(r"\s*```$", "", raw.strip())
+    try:
+        envelope = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"model did not return valid JSON: {e}; raw[:300]={raw[:300]!r}")
+    proposals = envelope.get("proposals") or []
+    if not isinstance(proposals, list):
+        raise RuntimeError("envelope.proposals is not a list")
+    return proposals
+
+
+def existing_proposal_slugs(itype: str) -> set[str]:
+    """Slugs of non-obsolete proposals for this type, to dedupe across runs."""
+    out: set[str] = set()
+    if not PROPOSALS_DIR.exists():
+        return out
+    safe_type = re.sub(r"[^a-zA-Z0-9_-]", "-", itype)
+    for f in PROPOSALS_DIR.glob(f"{safe_type}-*.md"):
+        try:
+            fm, _ = parse_frontmatter(f.read_text())
+        except Exception:
+            continue
+        if fm.get("status") == "obsolete":
+            continue
+        # Prefer explicit slug stored in frontmatter; fall back to filename suffix.
+        slug = fm.get("derived_slug")
+        if not slug:
+            stem = f.stem
+            prefix = f"{safe_type}-"
+            slug = stem[len(prefix):] if stem.startswith(prefix) else stem
+        out.add(slug)
+    return out
+
+
+def _fm_line(key: str, value) -> str:
+    if isinstance(value, (dict, list)):
+        return f"{key}: {json.dumps(value)}"
+    if value is None:
+        return f"{key}: null"
+    if isinstance(value, bool):
+        return f"{key}: {'true' if value else 'false'}"
+    if isinstance(value, (int, float)):
+        return f"{key}: {value}"
+    s = str(value)
+    if any(c in s for c in ':"\'\n#') or s.strip() != s:
+        return f"{key}: {json.dumps(s)}"
+    return f"{key}: {s}"
+
+
+def write_proposal(itype: str, p: dict, source_learning: Path) -> Path | None:
+    slug = slugify(p.get("slug") or p.get("title"))
+    if not slug:
+        return None
+    PROPOSALS_DIR.mkdir(parents=True, exist_ok=True)
+    safe_type = re.sub(r"[^a-zA-Z0-9_-]", "-", itype)
+    path = PROPOSALS_DIR / f"{safe_type}-{slug}.md"
+    if path.exists():
+        return None  # don't overwrite — a human may have annotated it
+    title = p.get("title") or "(untitled)"
+    fm_pairs = [
+        ("type", "incident-learn-proposal"),
+        ("learning_type", itype),
+        ("derived_slug", slug),
+        ("title", title),
+        ("kind", p.get("kind") or "other"),
+        ("status", "proposed"),
+        ("created_at", now_iso()),
+        ("analyzer_model", MODEL),
+        ("source_learning", source_learning.name),
+        ("evidence", p.get("evidence") or {}),
+    ]
+    fm_lines = ["---"] + [_fm_line(k, v) for k, v in fm_pairs] + ["---"]
+    body_lines = [
+        f"# {title}",
+        "",
+        "## Rationale",
+        p.get("rationale") or "(none provided)",
+        "",
+        "## Patch sketch",
+        p.get("patch_sketch") or "(none provided)",
+    ]
+    if p.get("target_hint"):
+        body_lines += ["", f"**Target hint:** {p['target_hint']}"]
+    body_lines += [
+        "",
+        "## Decision",
+        "*Awaiting review. Set frontmatter `status:` to `applied`, `wontfix`, or `obsolete` to close.*",
+        "",
+    ]
+    path.write_text("\n".join(fm_lines) + "\n\n" + "\n".join(body_lines))
+    return path
+
+
+def cmd_propose_patches(args) -> int:
+    if not LEARNINGS_DIR.exists():
+        print(f"No learnings dir at {LEARNINGS_DIR} — run `incident-learn` first.")
+        return 0
+    files = sorted(LEARNINGS_DIR.glob("*.md"))
+    if args.type:
+        files = [f for f in files if f.stem == args.type]
+    if not files:
+        print(f"No learnings files matched. Run `incident-learn` first.")
+        return 0
+
+    n_proposed = 0
+    n_skipped_existing = 0
+    n_skipped_no_candidates = 0
+    n_errors = 0
+
+    for f in files:
+        try:
+            text = f.read_text()
+            fm, body = parse_frontmatter(text)
+        except Exception as e:
+            print(f"  ERR reading {f.name}: {e}", file=sys.stderr)
+            n_errors += 1
+            continue
+
+        itype = fm.get("type") or f.stem
+        candidates_section = extract_detector_candidates(body)
+        if not candidates_section or candidates_section.lower().startswith("(none"):
+            n_skipped_no_candidates += 1
+            if args.verbose:
+                print(f"  skip {itype}: no detector candidates")
+            continue
+
+        try:
+            proposals = call_propose_model(itype, body)
+        except Exception as e:
+            print(f"  ERR proposing for {itype}: {e}", file=sys.stderr)
+            n_errors += 1
+            continue
+
+        if not proposals:
+            n_skipped_no_candidates += 1
+            if args.verbose:
+                print(f"  skip {itype}: model returned 0 proposals")
+            continue
+
+        existing = existing_proposal_slugs(itype)
+        for p in proposals:
+            slug = slugify(p.get("slug") or p.get("title"))
+            if not slug:
+                n_errors += 1
+                continue
+            if slug in existing:
+                n_skipped_existing += 1
+                if args.verbose:
+                    print(f"  skip {itype}-{slug}: already exists")
+                continue
+            if args.dry_run:
+                print(f"\n----- proposed: {itype}-{slug} -----")
+                print(f"  title:     {p.get('title')}")
+                print(f"  kind:      {p.get('kind')}")
+                print(f"  rationale: {(p.get('rationale') or '')[:200]}")
+                print(f"  sketch:    {(p.get('patch_sketch') or '')[:200]}")
+                if p.get("target_hint"):
+                    print(f"  target:    {p['target_hint']}")
+                n_proposed += 1
+                existing.add(slug)
+                continue
+            path = write_proposal(itype, p, f)
+            if path:
+                print(f"  wrote {path}")
+                n_proposed += 1
+                existing.add(slug)
+            else:
+                n_skipped_existing += 1
+
+    print(
+        f"incident-learn --propose-patches: proposed={n_proposed} "
+        f"skipped_existing={n_skipped_existing} skipped_no_candidates={n_skipped_no_candidates} "
+        f"errors={n_errors}"
+    )
+    return 0
+
+
+# ---------- pipeline ----------
+
+def collect(window_days: int) -> dict[str, list[dict]]:
+    since = datetime.now(timezone.utc) - timedelta(days=window_days)
+    grouped: dict[str, list[dict]] = defaultdict(list)
+    for f in iter_incidents():
+        try:
+            fm, body = parse_frontmatter(f.read_text())
+        except Exception:
+            continue
+        if not within_window(fm, since):
+            continue
+        itype = fm.get("type") or "other"
+        grouped[itype].append({"path": str(f), "fm": fm, "body": body})
+    return grouped
+
+
+def main():
+    p = argparse.ArgumentParser(prog="incident-learn")
+    p.add_argument("--type", help="distill (or propose for) one type only")
+    p.add_argument("--window-days", type=int, default=30)
+    p.add_argument("--min-incidents", type=int, default=2)
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--verbose", "-v", action="store_true")
+    p.add_argument(
+        "--propose-patches",
+        action="store_true",
+        help="read learnings/*.md and emit per-candidate proposal artifacts to proposals/",
+    )
+    args = p.parse_args()
+
+    if args.propose_patches:
+        return cmd_propose_patches(args)
+
+    grouped = collect(args.window_days)
+    if args.type:
+        grouped = {args.type: grouped.get(args.type, [])}
+
+    n_distilled = 0
+    n_skipped = 0
+    for itype, incidents in sorted(grouped.items(), key=lambda kv: -len(kv[1])):
+        if len(incidents) < args.min_incidents:
+            n_skipped += 1
+            if args.verbose:
+                print(f"  skip {itype}: {len(incidents)} incidents (< {args.min_incidents})")
+            continue
+        try:
+            md = distill(itype, incidents, args.window_days)
+        except Exception as e:
+            print(f"  ERR distilling {itype}: {e}", file=sys.stderr)
+            continue
+        if args.dry_run:
+            print(f"\n===== {itype} (n={len(incidents)}) =====")
+            print(md)
+            n_distilled += 1
+        else:
+            path = write_learning(itype, len(incidents), args.window_days, md)
+            print(f"  wrote {path} (n={len(incidents)})")
+            n_distilled += 1
+
+    print(f"incident-learn: distilled={n_distilled} skipped={n_skipped} window={args.window_days}d threshold={args.min_incidents}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

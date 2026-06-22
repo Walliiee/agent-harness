@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+# `drift` — entry point for human-observed drift incidents.
+# Usage:
+#   drift add [--agent X] [--severity low|med|high] [--type T] "title…"
+#   drift add --agent main "Agent repeats output across daily emails"
+#   drift add --agent dev --severity high "builder skill outputs wrong section order"
+#   echo "long body…" | drift add --agent main "Agent repeats output"
+#
+# Fires emit → analyze → notify, same pipeline as cron-postmortem.
+
+set -euo pipefail
+
+OPENCLAW_HOME="${OPENCLAW_HOME:-$HOME/.openclaw}"
+# incident* live in the drift cluster alongside this script.
+INCIDENT_CLI="${INCIDENT_CLI:-$OPENCLAW_HOME/bin/drift/incident}"
+ANALYZE_CLI="${ANALYZE_CLI:-$OPENCLAW_HOME/bin/drift/incident-analyze}"
+NOTIFY_CLI="${NOTIFY_CLI:-$OPENCLAW_HOME/bin/drift/incident-notify}"
+
+cmd="${1:-}"
+shift || true
+
+case "$cmd" in
+  add)
+    agent=""
+    severity="med"
+    type_hint=""
+    no_analyze=0
+    no_notify=0
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --agent) agent="$2"; shift 2;;
+        --severity) severity="$2"; shift 2;;
+        --type) type_hint="$2"; shift 2;;
+        --no-analyze) no_analyze=1; shift;;
+        --no-notify) no_notify=1; shift;;
+        --) shift; break;;
+        -*) echo "unknown flag: $1" >&2; exit 2;;
+        *) break;;
+      esac
+    done
+    title="${*:-}"
+    if [[ -z "$title" ]]; then
+      echo "usage: drift add [--agent X] [--severity low|med|high] [--type T] \"title…\"" >&2
+      exit 2
+    fi
+    # Stdin body (if any) becomes raw context
+    raw=""
+    if [[ ! -t 0 ]]; then
+      raw="$(cat)"
+    fi
+
+    # Stable key: source + title + agent + day (so same title same day dedups)
+    key="manual-$(printf '%s' "$title|$agent|$(date -u +%Y-%m-%d)" | shasum -a 1 | cut -c1-12)"
+
+    emit_args=(
+      emit
+      --source manual
+      --severity "$severity"
+      --title "$title"
+      --key "$key"
+    )
+    [[ -n "$agent" ]] && emit_args+=(--agent "$agent")
+    [[ -n "$type_hint" ]] && emit_args+=(--type "$type_hint")
+
+    body="$raw"
+    if [[ -z "$body" ]]; then
+      body="(no body — manual observation only)"
+    fi
+
+    inc_id="$(printf '%s' "$body" | "$INCIDENT_CLI" "${emit_args[@]}")"
+    echo "emitted: $inc_id"
+
+    if [[ "$no_analyze" -eq 0 ]]; then
+      "$ANALYZE_CLI" "$inc_id" >/dev/null || echo "WARN: analyze failed" >&2
+    fi
+    if [[ "$no_notify" -eq 0 ]]; then
+      "$NOTIFY_CLI" "$inc_id" || echo "WARN: notify failed" >&2
+    fi
+    ;;
+  list)
+    "$INCIDENT_CLI" list --source manual "$@"
+    ;;
+  show)
+    "$INCIDENT_CLI" show "$@"
+    ;;
+  *)
+    cat <<EOF
+drift — human-observed drift incidents
+
+Commands:
+  drift add [opts] "title"   emit a manual drift, analyze, notify Drift topic
+  drift list                 list manual incidents
+  drift show <id>            show one incident
+
+Options for add:
+  --agent <id>               which agent/workspace is affected (main, dev, …)
+  --severity <low|med|high>  default: med
+  --type <hint>              taxonomy hint (skipped if not in known set)
+  --no-analyze               skip LLM analysis
+  --no-notify                skip Telegram notification
+
+Body: pipe extra context via stdin. Example:
+  drift add --agent main "Daily intel repeating headlines" <<< "Same 3 stories Mon-Thu this week, dedup not catching them."
+EOF
+    ;;
+esac

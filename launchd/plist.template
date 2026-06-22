@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Parameterized LaunchAgent template. install-launchagents.sh renders one
+  copy per job in jobs.yaml. Placeholders (double-brace LABEL / PROGRAM_ARGS /
+  SCHEDULE_BLOCK) are replaced with: the job label; a block of string elements
+  for the command + its args (typically routed through the skill-wrapper); and
+  a StartInterval or StartCalendarInterval block respectively. The OPENCLAW_HOME
+  variable is expanded to a concrete path so logs land under its .openclaw/logs.
+  See launchd/jobs.yaml for the job declarations and the README for details.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>{{LABEL}}</string>
+  <key>ProgramArguments</key>
+  <array>
+{{PROGRAM_ARGS}}
+  </array>
+{{SCHEDULE_BLOCK}}
+  <key>RunAtLoad</key>
+  <false/>
+  <key>StandardOutPath</key>
+  <string>${OPENCLAW_HOME}/logs/{{LABEL}}.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>${OPENCLAW_HOME}/logs/{{LABEL}}.err.log</string>
+  <key>WorkingDirectory</key>
+  <string>${OPENCLAW_HOME}</string>
+</dict>
+</plist>

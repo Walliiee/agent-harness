@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+# hypothesis-current — find active (unresolved) hypothesis commit for an agent+skill.
+#
+# Usage:
+#   hypothesis-current --agent <name> --skill <name>
+#
+# Looks for the most recent commit in the agent's workspace git repo that:
+#   1. Has both `Hypothesis:` and `Verify-At:` trailers in its commit message
+#   2. The Verify-At value matches the requested --skill
+#   3. Is not yet resolved (no skill-runs record with verify_status: kept|reverted referencing this SHA)
+#
+# Prints the commit SHA on stdout if found, nothing otherwise. Exit 0 either way
+# (skill-run start treats "no output" as "no hypothesis"). Non-zero exit indicates error.
+#
+# Hypothesis commit format (in the affected agent's workspace):
+#
+#   <subject line>
+#
+#   <optional body>
+#
+#   Hypothesis: timeout increase reduces stale-inbox failures
+#   Verify-At: some-skill-name
+#   Expected: failure rate drops below 5% over next 7 runs
+
+set -uo pipefail
+
+OPENCLAW_HOME="${OPENCLAW_HOME:-$HOME/.openclaw}"
+SKILL_RUNS_DIR="$OPENCLAW_HOME/skill-runs"
+
+# --- agents.map resolution (id ws persona), drops anything not declared there ---
+AGENTS_MAP_FILE="${AGENTS_MAP:-}"
+if [ -z "$AGENTS_MAP_FILE" ] || [ ! -f "$AGENTS_MAP_FILE" ]; then
+  if [ -f "$OPENCLAW_HOME/config/agents.map" ]; then
+    AGENTS_MAP_FILE="$OPENCLAW_HOME/config/agents.map"
+  else
+    _self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    AGENTS_MAP_FILE="$_self_dir/../../config/agents.map"
+  fi
+fi
+# Iterate rows (id ws persona), skipping comments/blanks:
+read_agents() {
+  if [ -f "$AGENTS_MAP_FILE" ]; then
+    grep -vE '^\s*#' "$AGENTS_MAP_FILE" | awk 'NF>=3 {print $1, $2, $3}'
+  else
+    printf 'main workspace Orchestrator\ndev workspace-dev Developer\n'
+  fi
+}
+
+AGENT=""
+SKILL=""
+SINCE="${OPENCLAW_HYPOTHESIS_LOOKBACK:-90 days ago}"
+
+usage() {
+  sed -n '2,22p' "$0" | sed 's/^# \?//'
+  exit "${1:-0}"
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --agent)  AGENT="$2"; shift 2 ;;
+    --skill)  SKILL="$2"; shift 2 ;;
+    --since)  SINCE="$2"; shift 2 ;;
+    -h|--help) usage 0 ;;
+    *) echo "hypothesis-current: unknown arg: $1" >&2; usage 2 ;;
+  esac
+done
+
+[ -n "$AGENT" ] || { echo "hypothesis-current: --agent required" >&2; exit 2; }
+[ -n "$SKILL" ] || { echo "hypothesis-current: --skill required" >&2; exit 2; }
+
+# Map agent → workspace dir via agents.map. Match against both the agent-id and
+# the persona-label so callers can pass either.
+WORKSPACE=""
+while read -r _id _ws _persona; do
+  if [ "$AGENT" = "$_id" ] || [ "$AGENT" = "$_persona" ]; then
+    WORKSPACE="$OPENCLAW_HOME/$_ws"
+    break
+  fi
+done < <(read_agents)
+
+[ -n "$WORKSPACE" ] || { echo "hypothesis-current: unknown agent: $AGENT" >&2; exit 2; }
+
+[ -d "$WORKSPACE/.git" ] || exit 0  # No git → no hypotheses possible
+
+is_resolved() {
+  local sha="$1"
+  [ -d "$SKILL_RUNS_DIR" ] || return 1
+  # Find any record with this hypothesis_ref AND a terminal verify_status.
+  # Use grep -l for speed; combine with verify_status filter.
+  local candidates
+  candidates=$(grep -rl "hypothesis_ref: $sha" "$SKILL_RUNS_DIR" 2>/dev/null) || true
+  [ -n "$candidates" ] || return 1
+  echo "$candidates" | while read -r f; do
+    if grep -qE 'verify_status: (kept|reverted)' "$f" 2>/dev/null; then
+      echo "RESOLVED"
+      return 0
+    fi
+  done | grep -q RESOLVED
+}
+
+# Walk commits newest-first; print the first unresolved match.
+# Format: <SHA><TAB><Verify-At value>
+git -C "$WORKSPACE" log --since="$SINCE" \
+  --grep='^Hypothesis:' --grep='^Verify-At:' --all-match \
+  --format='%H%x09%(trailers:key=Verify-At,valueonly,separator=,)' 2>/dev/null \
+| while IFS=$'\t' read -r sha verify_at; do
+    verify_at=$(echo "$verify_at" | tr -d '[:space:]')
+    [ "$verify_at" = "$SKILL" ] || continue
+    if ! is_resolved "$sha"; then
+      echo "$sha"
+      exit 0  # exits the subshell
+    fi
+  done
+
+exit 0

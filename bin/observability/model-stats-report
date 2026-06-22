@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Part of agent-harness (https://github.com/${GH_ORG}/agent-harness)
+"""Per-model reliability report from the interaction log (harvested cron runs + any live
+records). The payoff: reorder fallback chains on EVIDENCE, not intuition.
+
+Two views:
+  - As actual runner: which model did the work, how reliable/fast/expensive.
+  - As configured primary: how often a primary fell back -> the demote/promote signal.
+
+Usage: model-stats-report [--days N]    (default: all history)
+"""
+import json, os, argparse
+from collections import defaultdict
+from datetime import datetime, timezone, timedelta
+
+OPENCLAW_HOME = os.environ.get("OPENCLAW_HOME", os.path.expanduser("~/.openclaw"))
+LOG = os.path.join(OPENCLAW_HOME, "state", "interaction-log.jsonl")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--days", type=int, default=0)
+    a = ap.parse_args()
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=a.days)) if a.days > 0 else None
+
+    actual = defaultdict(lambda: {"n": 0, "ok": 0, "err": 0, "dur": 0, "durn": 0, "tok": 0})
+    prim = defaultdict(lambda: {"att": 0, "nofb": 0, "fb": 0})
+    total = 0
+    for line in open(LOG, encoding="utf-8"):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            r = json.loads(line)
+        except Exception:
+            continue
+        if not r.get("model") or not r.get("outcome"):
+            continue
+        if cutoff:
+            try:
+                if datetime.fromisoformat(r["ts"]) < cutoff:
+                    continue
+            except Exception:
+                pass
+        total += 1
+        d = actual[r["model"]]
+        d["n"] += 1
+        d["ok"] += r["outcome"] == "success"
+        d["err"] += r["outcome"] == "error"
+        if isinstance(r.get("duration_ms"), (int, float)):
+            d["dur"] += r["duration_ms"]; d["durn"] += 1
+        if isinstance(r.get("total_tokens"), (int, float)):
+            d["tok"] += r["total_tokens"]
+        p = r.get("primary")
+        if p:
+            pp = prim[p]; pp["att"] += 1
+            pp["fb" if r.get("fell_back") else "nofb"] += 1
+
+    span = f"last {a.days} days" if a.days else "all history"
+    actual_rows = []
+    for m, d in sorted(actual.items(), key=lambda x: -x[1]["n"]):
+        n = d["n"]
+        avs = (d["dur"] / d["durn"] / 1000) if d["durn"] else 0
+        actual_rows.append({
+            "model": m,
+            "runs": n,
+            "ok": 100 * d["ok"] / n,
+            "err": 100 * d["err"] / n,
+            "avg_s": avs,
+            "mtok": d["tok"] / 1e6,
+        })
+
+    primary_rows = []
+    for p, d in sorted(prim.items(), key=lambda x: -x[1]["att"]):
+        att = d["att"]
+        primary_rows.append({
+            "model": p,
+            "attempts": att,
+            "ran": 100 * d["nofb"] / att,
+            "fellback": d["fb"],
+        })
+
+    reliable = [r for r in actual_rows if r["runs"] >= 10 and r["ok"] >= 99]
+    fastest = min((r for r in actual_rows if r["runs"] >= 10), key=lambda r: r["avg_s"], default=None)
+    demote = [r for r in primary_rows if r["attempts"] >= 10 and r["ran"] < 90]
+
+    print(f"Model Reliability ({span})")
+    print(f"Scope: {total} cron/model runs harvested from interaction logs.")
+    if reliable:
+        names = ", ".join(r["model"] for r in reliable[:3])
+        print(f"Reliable runners: {names}.")
+    if fastest:
+        print(f"Fastest regular runner: {fastest['model']} ({fastest['avg_s']:.0f}s avg).")
+    if demote:
+        names = ", ".join(f"{r['model']} ({r['ran']:.0f}% ran, {r['fellback']} fallbacks)" for r in demote[:3])
+        print(f"Review as primaries: {names}.")
+    else:
+        print("Primary fallback signal: no obvious demotion candidate.")
+
+    print("\nTop runners")
+    for r in actual_rows[:6]:
+        print(
+            f"- {r['model']}: {r['runs']} runs, {r['ok']:.0f}% ok, "
+            f"{r['err']:.0f}% err, {r['avg_s']:.0f}s avg, {r['mtok']:.1f}M tokens"
+        )
+
+    print("\nPrimary fallback signal")
+    for r in primary_rows[:6]:
+        print(
+            f"- {r['model']}: {r['attempts']} attempts, "
+            f"{r['ran']:.0f}% ran without fallback, {r['fellback']} fallbacks"
+        )
+
+    print("\nHow to read this: 'Top runners' shows the model that actually did the work. "
+          "'Primary fallback signal' shows whether a configured primary had to hand off too often.")
+
+
+if __name__ == "__main__":
+    main()

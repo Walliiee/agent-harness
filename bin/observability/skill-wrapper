@@ -1,0 +1,194 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+# Part of agent-harness (https://github.com/${GH_ORG}/agent-harness)
+#
+# skill-wrapper — universal observability shim.
+#
+# Usage:
+#   skill-wrapper --skill <name> --agent <name> [--trigger T] [--parent-run-id P] -- <command...>
+#
+# Calls skill-run start, executes the wrapped command, calls skill-run end with
+# outcome derived from exit code + per-skill success check + recovery detection.
+# Forwards the wrapped command's exit code so callers (cron, scripts) see it unchanged.
+#
+# Per-skill success check: set env var SKILL_SUCCESS_CHECK_<SKILL_NAME_UPPER_SNAKE>
+# to a shell expression evaluated post-command. Its exit code becomes task_completion.
+# Custom checks can be added to ${OPENCLAW_HOME}/skill-runs/success-checks.env (auto-sourced).
+#
+# Schema: ${OPENCLAW_HOME}/skill-runs/README.md
+# Architecture: ${OPENCLAW_HOME}/skill-runs/ARCHITECTURE.md
+
+set -uo pipefail
+
+OPENCLAW_HOME="${OPENCLAW_HOME:-$HOME/.openclaw}"
+SKILL_RUN_CLI="${OPENCLAW_SKILL_RUN_CLI:-$OPENCLAW_HOME/bin/observability/skill-run}"
+SUCCESS_CHECKS_ENV="$OPENCLAW_HOME/skill-runs/success-checks.env"
+RECOVERY_MARKERS_FILE="$OPENCLAW_HOME/skill-runs/recovery-markers.txt"
+ERROR_MARKERS_FILE="$OPENCLAW_HOME/skill-runs/error-markers.txt"
+
+# ---------- defaults ----------
+
+SKILL=""
+AGENT=""
+TRIGGER="cron"
+PARENT_RUN_ID=""
+
+# ---------- arg parse ----------
+
+usage() {
+  sed -n '5,21p' "$0" | sed 's/^# \?//'
+  exit "${1:-0}"
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --skill)            SKILL="$2"; shift 2 ;;
+    --agent)            AGENT="$2"; shift 2 ;;
+    --trigger)          TRIGGER="$2"; shift 2 ;;
+    --parent-run-id)    PARENT_RUN_ID="$2"; shift 2 ;;
+    -h|--help)          usage 0 ;;
+    --)                 shift; break ;;
+    *)                  echo "skill-wrapper: unknown arg: $1" >&2; usage 1 ;;
+  esac
+done
+
+if [ -z "$SKILL" ] || [ -z "$AGENT" ]; then
+  echo "skill-wrapper: --skill and --agent are required" >&2
+  usage 1
+fi
+if [ $# -eq 0 ]; then
+  echo "skill-wrapper: no command provided after --" >&2
+  usage 1
+fi
+
+# ---------- nested wrap detection ----------
+# If a parent wrapper already exported OPENCLAW_RUN_ID, treat this as a nested run.
+# Explicit --parent-run-id wins if the caller set it.
+if [ -n "${OPENCLAW_RUN_ID:-}" ] && [ -z "$PARENT_RUN_ID" ]; then
+  PARENT_RUN_ID="$OPENCLAW_RUN_ID"
+  TRIGGER="nested"
+fi
+
+# ---------- load per-skill overrides ----------
+
+if [ -f "$SUCCESS_CHECKS_ENV" ]; then
+  # shellcheck disable=SC1090
+  . "$SUCCESS_CHECKS_ENV"
+fi
+
+# ---------- start the run ----------
+
+START_ARGS=(start --skill "$SKILL" --agent "$AGENT" --trigger "$TRIGGER")
+if [ -n "$PARENT_RUN_ID" ]; then
+  START_ARGS+=(--parent-run-id "$PARENT_RUN_ID")
+fi
+
+RUN_ID=$("$SKILL_RUN_CLI" "${START_ARGS[@]}" 2>/dev/null)
+if [ -z "$RUN_ID" ]; then
+  echo "skill-wrapper: skill-run start failed; executing command without instrumentation" >&2
+  exec "$@"
+fi
+
+export OPENCLAW_RUN_ID="$RUN_ID"
+
+# ---------- run the wrapped command, capturing stderr ----------
+
+STDERR_TMP=$(mktemp -t skill-wrapper.XXXXXX)
+trap 'rm -f "$STDERR_TMP"' EXIT
+
+# Pipe stderr through tee so it stays visible to the caller AND is captured.
+# Using a process substitution preserves the wrapped command's exit code.
+"$@" 2> >(tee "$STDERR_TMP" >&2)
+CMD_EXIT=$?
+
+# ---------- success check ----------
+
+VAR_NAME="SKILL_SUCCESS_CHECK_$(echo "$SKILL" | tr '[:lower:]-' '[:upper:]_')"
+SUCCESS_CHECK="${!VAR_NAME-}"
+
+if [ -n "$SUCCESS_CHECK" ]; then
+  bash -c "$SUCCESS_CHECK" >/dev/null 2>&1
+  CHECK_EXIT=$?
+  if [ "$CHECK_EXIT" -eq 0 ]; then
+    TASK_COMPLETION="true"
+    COMPLETION_EVIDENCE="success check passed: $SUCCESS_CHECK"
+  else
+    TASK_COMPLETION="false"
+    COMPLETION_EVIDENCE="success check failed (exit $CHECK_EXIT): $SUCCESS_CHECK"
+  fi
+else
+  if [ "$CMD_EXIT" -eq 0 ]; then
+    TASK_COMPLETION="true"
+    COMPLETION_EVIDENCE="exit 0 (no skill-specific success check defined)"
+  else
+    TASK_COMPLETION="false"
+    COMPLETION_EVIDENCE="exit $CMD_EXIT (no skill-specific success check defined)"
+  fi
+fi
+
+# ---------- recovery detection ----------
+
+errors_observed=false
+recovery_observed=false
+
+if [ -s "$STDERR_TMP" ]; then
+  # Default markers if files don't exist
+  default_errors='error|failed|ERROR|Exception|Traceback|fatal'
+  default_recovery='falling back to|fallback to|retrying|retried successfully|recovered'
+
+  if [ -r "$ERROR_MARKERS_FILE" ]; then
+    err_pattern=$(grep -v '^#' "$ERROR_MARKERS_FILE" | grep -v '^$' | paste -sd '|' -)
+  else
+    err_pattern="$default_errors"
+  fi
+  if [ -r "$RECOVERY_MARKERS_FILE" ]; then
+    rec_pattern=$(grep -v '^#' "$RECOVERY_MARKERS_FILE" | grep -v '^$' | paste -sd '|' -)
+  else
+    rec_pattern="$default_recovery"
+  fi
+
+  if grep -qE "$err_pattern" "$STDERR_TMP" 2>/dev/null; then
+    errors_observed=true
+  fi
+  if grep -qE "$rec_pattern" "$STDERR_TMP" 2>/dev/null; then
+    recovery_observed=true
+  fi
+fi
+
+if ! $errors_observed; then
+  ERROR_RECOVERY="true"
+  RECOVERY_EVIDENCE="no error markers observed in stderr"
+elif $recovery_observed && [ "$CMD_EXIT" -eq 0 ]; then
+  ERROR_RECOVERY="true"
+  RECOVERY_EVIDENCE="errors observed; recovery markers fired; final exit 0"
+elif $recovery_observed && [ "$CMD_EXIT" -ne 0 ]; then
+  ERROR_RECOVERY="false"
+  RECOVERY_EVIDENCE="errors observed; recovery attempted; final exit $CMD_EXIT"
+else
+  ERROR_RECOVERY="false"
+  RECOVERY_EVIDENCE="errors observed; no recovery markers; exit $CMD_EXIT"
+fi
+
+# ---------- determine outcome ----------
+
+if [ "$TASK_COMPLETION" = "true" ] && [ "$ERROR_RECOVERY" = "true" ]; then
+  OUTCOME="success"
+elif [ "$TASK_COMPLETION" = "true" ] && [ "$ERROR_RECOVERY" = "false" ]; then
+  OUTCOME="degraded"
+else
+  OUTCOME="failure"
+fi
+
+# ---------- end the run ----------
+
+"$SKILL_RUN_CLI" end "$RUN_ID" \
+  --outcome "$OUTCOME" \
+  --task-completion "$TASK_COMPLETION" \
+  --error-recovery "$ERROR_RECOVERY" \
+  --exit-code "$CMD_EXIT" \
+  --completion-evidence "$COMPLETION_EVIDENCE" \
+  --recovery-evidence "$RECOVERY_EVIDENCE" \
+  >/dev/null 2>&1 || echo "skill-wrapper: skill-run end failed for $RUN_ID" >&2
+
+# Forward the wrapped command's exit code unchanged
+exit "$CMD_EXIT"

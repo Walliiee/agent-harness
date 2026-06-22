@@ -1,0 +1,382 @@
+#!/usr/bin/env python3
+"""Drift incident corrective retry (Loop 2).
+
+When a cron fails with a tool-misuse error (file-edit-mismatch, file-read-failed,
+write-to-existing-file), spawn a one-shot agent turn with corrective prompting
+*instead* of falling back to model-swap. The premise:
+
+  Model swap doesn't fix tool-discipline failures. A teacher LLM telling the
+  failing pattern "read first, then edit" — with the actual error in context —
+  does.
+
+Flow:
+  1. Read the incident; classify the tool-misuse subtype from the error excerpt.
+  2. Construct a corrective prompt: original cron task + failure context + the
+     specific discipline that was violated.
+  3. Spawn `openclaw agent --agent <id> --message <prompt> --model <retry-model>`.
+  4. If the retry succeeds (returncode 0, no tool errors in output) → mark the
+     incident `recovered-on-retry`, post a one-line Drift ack, return 0.
+  5. If the retry fails → fall through (return non-zero so the watcher invokes
+     the normal analyze→judge→notify chain).
+
+Usage:
+  incident-retry <incident-id>           # try corrective retry
+  incident-retry <incident-id> --dry-run # show prompt + plan, no execution
+  incident-retry --classify <inc-id>     # just print the classified subtype
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+ROOT = Path(os.environ.get("OPENCLAW_INCIDENTS_DIR", str(Path.home() / ".openclaw" / "incidents")))
+OPENCLAW = os.environ.get("OPENCLAW_BIN", "openclaw")
+RETRY_MODEL = os.environ.get("DRIFT_RETRY_MODEL", "ollama/glm-5.1:cloud")
+RETRY_TIMEOUT_S = int(os.environ.get("DRIFT_RETRY_TIMEOUT", "600"))
+RETRY_ENABLED = os.environ.get("DRIFT_RETRY", "1") not in ("0", "false", "no")
+
+# Telegram routing — read from env, EMPTY by default. When HARNESS_TG_CHAT_ID is
+# unset the Drift ack becomes a no-op (see post_drift()).
+#   HARNESS_TG_CHAT_ID        — target chat/group id for the ops group
+#   HARNESS_TG_DRIFT_TOPIC_ID — topic (thread) id for the Drift topic
+DRIFT_CHAT = os.environ.get("HARNESS_TG_CHAT_ID", "")
+DRIFT_THREAD = os.environ.get("HARNESS_TG_DRIFT_TOPIC_ID", "")
+DRIFT_ACCOUNT = os.environ.get("DRIFT_ACCOUNT", "main")
+
+FRONTMATTER_RE = re.compile(r"^---\n(.*?)\n---\n(.*)$", re.DOTALL)
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# ---------- frontmatter I/O (matches incident-apply) ----------
+
+def parse_frontmatter(text: str) -> tuple[dict, str]:
+    m = FRONTMATTER_RE.match(text)
+    if not m:
+        raise ValueError("missing frontmatter")
+    fm_text, body = m.group(1), m.group(2)
+    fm: dict = {}
+    for raw_line in fm_text.split("\n"):
+        if not raw_line.strip() or raw_line.startswith(" "):
+            continue
+        if ":" not in raw_line:
+            continue
+        k, _, v = raw_line.partition(":")
+        fm[k.strip()] = _scalar(v.strip())
+    return fm, body
+
+
+def _scalar(v: str):
+    if v in ("null", "~", ""):
+        return None
+    if v == "true":
+        return True
+    if v == "false":
+        return False
+    if v.startswith('"') and v.endswith('"'):
+        try:
+            return json.loads(v)
+        except json.JSONDecodeError:
+            return v[1:-1]
+    if v.startswith("{") or v.startswith("["):
+        try:
+            return json.loads(v)
+        except json.JSONDecodeError:
+            return v
+    try:
+        return int(v)
+    except ValueError:
+        pass
+    try:
+        return float(v)
+    except ValueError:
+        pass
+    return v
+
+
+def dump_yaml(d: dict) -> str:
+    lines = []
+    for k, v in d.items():
+        if v is None:
+            lines.append(f"{k}: null")
+        elif isinstance(v, bool):
+            lines.append(f"{k}: {'true' if v else 'false'}")
+        elif isinstance(v, (int, float)):
+            lines.append(f"{k}: {v}")
+        elif isinstance(v, str):
+            if v == "" or any(c in v for c in ":#\n\"'") or v.strip() != v:
+                lines.append(f"{k}: {json.dumps(v)}")
+            else:
+                lines.append(f"{k}: {v}")
+        elif isinstance(v, (dict, list)):
+            lines.append(f"{k}: {json.dumps(v, ensure_ascii=False)}")
+        else:
+            lines.append(f"{k}: {json.dumps(str(v))}")
+    return "\n".join(lines)
+
+
+def iter_incidents() -> list[Path]:
+    out: list[Path] = []
+    if not ROOT.exists():
+        return out
+    for day in sorted(ROOT.iterdir()):
+        if not day.is_dir() or not re.match(r"\d{4}-\d{2}-\d{2}", day.name):
+            continue
+        out.extend(sorted(day.glob("*.md")))
+    return out
+
+
+def find_by_id(inc_id: str) -> Path | None:
+    for f in iter_incidents():
+        try:
+            fm, _ = parse_frontmatter(f.read_text())
+        except Exception:
+            continue
+        if fm.get("id") == inc_id or (fm.get("id") or "").endswith(inc_id):
+            return f
+    return None
+
+
+# ---------- classification: which tool-misuse subtype is this? ----------
+
+# Subtypes drive the corrective teaching paragraph.
+TOOL_MISUSE_PATTERNS = [
+    # (subtype, regex matched against error excerpt, teaching text)
+    (
+        "edit-mismatch",
+        re.compile(r"📝\s*Edit:.*failed|Edit.*old_string.*not found|edit.*marker.*mismatch", re.IGNORECASE),
+        (
+            "The Edit tool failed because the `old_string` you passed did not match the file exactly. "
+            "Edit is NOT a guess-and-check tool — it requires that you Read the target file first, "
+            "then quote the exact text you want to replace (including surrounding context to make it unique)."
+        ),
+    ),
+    (
+        "write-on-existing",
+        re.compile(r"✍️\s*Write:.*failed|Write.*already exists|cannot overwrite", re.IGNORECASE),
+        (
+            "The Write tool failed because the file already exists. Write is for NEW files only. "
+            "For existing files, you must Read the current content first, then use Edit to change "
+            "specific parts (or Read + Write to fully replace, if intentional)."
+        ),
+    ),
+    (
+        "read-failed",
+        re.compile(r"📖\s*Read:.*failed|Read.*not found|ENOENT.*read", re.IGNORECASE),
+        (
+            "The Read tool failed — the file does not exist or the path is wrong. Before retrying, "
+            "use a directory listing or a search to find the correct path. Do not invent file paths."
+        ),
+    ),
+]
+
+
+def classify(error_excerpt: str) -> tuple[str | None, str | None]:
+    """Return (subtype, teaching) or (None, None) if not a tool-misuse pattern."""
+    if not error_excerpt:
+        return None, None
+    for subtype, pat, teaching in TOOL_MISUSE_PATTERNS:
+        if pat.search(error_excerpt):
+            return subtype, teaching
+    return None, None
+
+
+# ---------- corrective prompt + spawn ----------
+
+def _extract_job_payload(fm: dict, body: str) -> dict:
+    """Pull the original cron's payload from the incident body so we can replay the task."""
+    m = re.search(r"## Job payload \(truncated\)\n\{(.*?)\n\}\n", body, re.DOTALL)
+    if not m:
+        return {}
+    try:
+        # Wrap back into a JSON object (the heading strips outer braces in our regex).
+        return json.loads("{" + m.group(1) + "\n}")
+    except Exception:
+        return {}
+
+
+def build_corrective_prompt(fm: dict, body: str, subtype: str, teaching: str) -> str:
+    fields = fm.get("fields") if isinstance(fm.get("fields"), dict) else {}
+    cron_name = fields.get("cron_name") or "(unknown cron)"
+    error_excerpt = fields.get("error_excerpt") or "(no error excerpt)"
+    payload = _extract_job_payload(fm, body)
+    original_task = payload.get("message") or "(original task message unavailable)"
+
+    return f"""You are recovering from a failed previous run. Read this carefully before doing anything.
+
+## What just happened
+Cron `{cron_name}` failed with:
+> {error_excerpt}
+
+This is a `{subtype}` failure. {teaching}
+
+## What you must do now
+1. Re-read this discipline above. Internalize it.
+2. Use the Read tool on any file you are about to Edit or Write — first, every time.
+3. Re-attempt the original task, correctly this time. Do NOT skip steps to be faster.
+4. If after reading you discover the original task no longer makes sense (the file moved, content changed, target gone), stop and report what you found in one sentence rather than forcing a wrong edit.
+
+## Original task (reproduce, with the fix in mind)
+{original_task}
+"""
+
+
+def spawn_retry(fm: dict, prompt: str, dry_run: bool) -> dict:
+    agent_id = fm.get("agent") or "main"
+    cmd = [
+        OPENCLAW, "agent",
+        "--agent", agent_id,
+        "--model", RETRY_MODEL,
+        "--thinking", "off",
+        "--message", prompt,
+        "--json",
+        "--timeout", str(RETRY_TIMEOUT_S),
+    ]
+    if dry_run:
+        return {"ok": True, "dry_run": True, "command": " ".join(cmd[:5]) + " --message <…> --json"}
+
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=RETRY_TIMEOUT_S + 30)
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "reason": "retry exceeded timeout", "exit": "timeout"}
+
+    if p.returncode != 0:
+        return {"ok": False, "reason": (p.stderr.strip() or p.stdout.strip())[:400], "exit": p.returncode}
+
+    # Try to parse the JSON envelope to detect tool errors in the retry run.
+    envelope = None
+    out = (p.stdout or "").strip()
+    if out:
+        try:
+            envelope = json.loads(out)
+        except json.JSONDecodeError:
+            envelope = None
+
+    # Conservative success check: if we got a non-empty stdout and no obvious tool-failure marker
+    # in the reply text, treat as success. The next watcher tick will see whether the cron
+    # itself runs cleanly going forward.
+    text_blob = json.dumps(envelope) if envelope else out
+    tool_fail_marker = re.search(r"⚠️\s*(📝|✍️|📖)\s*\w+:.*failed", text_blob)
+    if tool_fail_marker:
+        return {"ok": False, "reason": f"retry hit another tool failure: {tool_fail_marker.group(0)[:160]}", "exit": p.returncode, "envelope": envelope}
+
+    summary = (envelope or {}).get("reply") or (envelope or {}).get("text") or out[:200]
+    return {
+        "ok": True,
+        "exit": p.returncode,
+        "summary": (summary if isinstance(summary, str) else json.dumps(summary))[:200],
+        "envelope": envelope,
+    }
+
+
+# ---------- Drift ack ----------
+
+def shorten(s: str, n: int) -> str:
+    s = (s or "").strip()
+    return s if len(s) <= n else s[: n - 1].rstrip() + "…"
+
+
+def post_drift(text: str) -> None:
+    if not DRIFT_CHAT:
+        print(f"incident-retry skip (HARNESS_TG_CHAT_ID unset): {text}", file=sys.stderr)
+        return
+    cmd = [
+        OPENCLAW, "message", "send",
+        "--channel", "telegram",
+        "--account", DRIFT_ACCOUNT,
+        "--target", DRIFT_CHAT,
+        "--thread-id", DRIFT_THREAD,
+        "--message", text,
+    ]
+    p = subprocess.run(cmd, capture_output=True, text=True)
+    if p.returncode != 0:
+        print(f"WARN: post failed: {p.stderr}", file=sys.stderr)
+
+
+# ---------- main ----------
+
+def run_one(path: Path, dry_run: bool, no_post: bool) -> int:
+    fm, body = parse_frontmatter(path.read_text())
+    fields = fm.get("fields") if isinstance(fm.get("fields"), dict) else {}
+    error_excerpt = fields.get("error_excerpt") or fm.get("title") or ""
+    subtype, teaching = classify(error_excerpt)
+    if not subtype:
+        print(json.dumps({"skipped": True, "reason": "not a tool-misuse pattern", "error_excerpt": error_excerpt[:160]}))
+        return 2  # non-zero so watcher knows to fall through
+
+    if not RETRY_ENABLED:
+        print(json.dumps({"skipped": True, "reason": "DRIFT_RETRY=0"}))
+        return 2
+
+    if fm.get("status") != "open":
+        print(json.dumps({"skipped": True, "reason": f"status={fm.get('status')!r}, expected open"}))
+        return 2
+
+    prompt = build_corrective_prompt(fm, body, subtype, teaching)
+    result = spawn_retry(fm, prompt, dry_run=dry_run)
+
+    # Always record the attempt on the incident.
+    fm["retry_attempt"] = {
+        "ran_at": now_iso(),
+        "subtype": subtype,
+        "model": RETRY_MODEL,
+        "ok": bool(result.get("ok")),
+        "reason": result.get("reason"),
+        "summary": result.get("summary"),
+    }
+    if dry_run:
+        print(json.dumps({"dry_run": True, "subtype": subtype, "prompt_chars": len(prompt), "plan": result}, indent=2))
+        return 0
+
+    if result.get("ok"):
+        fm["status"] = "recovered-on-retry"
+        fm["recovered_at"] = now_iso()
+        body = body.rstrip() + "\n\n## Retry\n\n```json\n" + json.dumps(fm["retry_attempt"], indent=2) + "\n```\n"
+        path.write_text(f"---\n{dump_yaml(fm)}\n---\n{body}")
+        if not no_post:
+            target = fields.get("cron_name") or fm.get("agent") or "?"
+            short_id = (fm.get("id") or "")[-12:]
+            post_drift(f"♻️ {target}: recovered on retry ({subtype})  ·  id …{short_id}")
+        print(json.dumps({"recovered": True, "subtype": subtype, "summary": result.get("summary", "")[:160]}))
+        return 0
+    else:
+        # Keep status=open so the normal pipeline picks it up; just persist the attempt.
+        body = body.rstrip() + "\n\n## Retry\n\n```json\n" + json.dumps(fm["retry_attempt"], indent=2) + "\n```\n"
+        path.write_text(f"---\n{dump_yaml(fm)}\n---\n{body}")
+        print(json.dumps({"retry_failed": True, "subtype": subtype, "reason": result.get("reason", "")[:200]}))
+        return 2  # non-zero → watcher falls through to normal analyze flow
+
+
+def main():
+    p = argparse.ArgumentParser(prog="incident-retry")
+    p.add_argument("id")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--no-post", action="store_true", help="skip Drift ack")
+    p.add_argument("--classify", action="store_true", help="just classify the error, don't retry")
+    args = p.parse_args()
+
+    path = find_by_id(args.id)
+    if not path:
+        print(f"not found: {args.id}", file=sys.stderr)
+        return 1
+
+    if args.classify:
+        fm, _ = parse_frontmatter(path.read_text())
+        fields = fm.get("fields") if isinstance(fm.get("fields"), dict) else {}
+        subtype, teaching = classify(fields.get("error_excerpt") or fm.get("title") or "")
+        print(json.dumps({"subtype": subtype, "teaching": teaching}, indent=2))
+        return 0 if subtype else 2
+
+    return run_one(path, dry_run=args.dry_run, no_post=args.no_post)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

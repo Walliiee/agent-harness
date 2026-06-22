@@ -1,0 +1,209 @@
+#!/usr/bin/env python3
+"""Post a one-line Drift notification for a given incident id.
+
+Reads the incident file, extracts key fields, sends a compact Telegram message
+to the Drift topic in the ops group.
+
+Usage: incident-notify <incident-id>
+       echo <incident-id> | incident-notify -
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(os.environ.get("OPENCLAW_INCIDENTS_DIR", str(Path.home() / ".openclaw" / "incidents")))
+OPENCLAW = os.environ.get("OPENCLAW_BIN", "openclaw")
+
+# Telegram routing — read from env, EMPTY by default. When HARNESS_TG_CHAT_ID is
+# unset the send step becomes a no-op (see main()).
+#   HARNESS_TG_CHAT_ID        — target chat/group id for the ops group
+#   HARNESS_TG_DRIFT_TOPIC_ID — topic (thread) id for the Drift topic
+DRIFT_CHAT = os.environ.get("HARNESS_TG_CHAT_ID", "")
+DRIFT_THREAD = os.environ.get("HARNESS_TG_DRIFT_TOPIC_ID", "")
+DRIFT_ACCOUNT = os.environ.get("DRIFT_ACCOUNT", "main")
+
+SEVERITY_ICON = {"low": "🟢", "med": "🟡", "high": "🔴"}
+STATUS_ICON = {"open": "◻️", "proposed": "📝", "applied": "✅", "wontfix": "⛔", "aged": "🕰"}
+FRONTMATTER_RE = re.compile(r"^---\n(.*?)\n---\n(.*)$", re.DOTALL)
+
+
+def find_incident(inc_id: str) -> Path | None:
+    for day in sorted(ROOT.iterdir()):
+        if not day.is_dir() or not re.match(r"\d{4}-\d{2}-\d{2}", day.name):
+            continue
+        for f in day.glob("*.md"):
+            text = f.read_text()
+            m = re.search(r"^id:\s*(\S+)", text, re.MULTILINE)
+            if m and (m.group(1) == inc_id or m.group(1).endswith(inc_id)):
+                return f
+    return None
+
+
+def parse_fm_full(text: str) -> dict:
+    """Read frontmatter + extract proposed_fix JSON from body if present."""
+    m = FRONTMATTER_RE.match(text)
+    if not m:
+        return {}
+    fm_text, body = m.group(1), m.group(2)
+    out: dict = {}
+    for line in fm_text.split("\n"):
+        if ":" not in line or line.startswith(" "):
+            continue
+        k, _, v = line.partition(":")
+        v = v.strip()
+        # Decode JSON-encoded strings (Unicode escapes etc.) written by dump_yaml.
+        if v.startswith('"') and v.endswith('"'):
+            try:
+                v = json.loads(v)
+            except (json.JSONDecodeError, ValueError):
+                v = v[1:-1]
+        # Decode inline JSON objects/arrays (fields, related, proposed_fix, judge_verdict, ...).
+        elif (v.startswith("{") and v.endswith("}")) or (v.startswith("[") and v.endswith("]")):
+            try:
+                v = json.loads(v)
+            except (json.JSONDecodeError, ValueError):
+                pass
+        out[k.strip()] = v
+    # Pull the analysis JSON block from the body for clean access to proposed_fix.
+    m2 = re.search(r"## Analysis\n\n```json\n(\{.*?\})\n```", body, re.DOTALL)
+    if m2:
+        try:
+            out["_proposal"] = json.loads(m2.group(1))
+        except Exception:
+            pass
+    return out
+
+
+def shorten(s: str, n: int) -> str:
+    s = s.strip()
+    return s if len(s) <= n else s[: n - 1].rstrip() + "…"
+
+
+def _named_target(fm: dict) -> str:
+    """Pick the most user-meaningful name for the thing this incident is about.
+
+    Cron failures: cron name (e.g. "sc-2350-main"). Freshness: path basename. Fallback: agent."""
+    fields = fm.get("fields") if isinstance(fm.get("fields"), dict) else {}
+    return (
+        fields.get("cron_name")
+        or fields.get("path")
+        or fm.get("agent")
+        or "?"
+    )
+
+
+def format_message(fm: dict, path: Path) -> str:
+    """Compact, decision-oriented Drift message. Keep it scannable on a phone."""
+    sev_icon = SEVERITY_ICON.get(fm.get("severity", "med"), "⚪")
+    target = _named_target(fm)
+    short_id = fm.get("id", "")[-12:]
+
+    prop = fm.get("_proposal") or {}
+    typ = prop.get("type") or fm.get("type") or "unclassified"
+    conf = prop.get("confidence")
+    problem = prop.get("problem") or []
+    options = prop.get("options") or []
+    recommended = prop.get("recommended")
+    open_q = (prop.get("open_questions") or "").strip()
+    judge = fm.get("judge_verdict") if isinstance(fm.get("judge_verdict"), dict) else None
+
+    # Header: severity · target · type · confidence
+    head = [f"{sev_icon} {shorten(str(target), 40)}", typ]
+    if isinstance(conf, (int, float)):
+        head.append(f"conf {conf:.2f}")
+    lines = [" · ".join(head)]
+
+    # Judge verdict (when present) leads — it's why the user is being asked at all
+    if judge and judge.get("apply") is False:
+        lines.append(f"🤔 judge declined auto-apply: {shorten(str(judge.get('reasoning','')), 200)}")
+
+    # One-line problem (drop bullets — pick the most informative)
+    if problem:
+        lines.append(shorten(str(problem[0]), 180))
+
+    # Options — one line each, terse
+    if options:
+        lines.append("")
+        for opt in options[:3]:
+            label = opt.get("label", "?")
+            star = "★" if label == recommended else " "
+            summary = shorten(str(opt.get("summary", "")), 140)
+            fk = opt.get("fix_kind", "?")
+            risk = opt.get("risk", "?")
+            auto = " ⚡" if opt.get("auto_safe") else ""
+            lines.append(f"{label}){star} {summary}  ·  {fk}·{risk}{auto}")
+
+    if open_q:
+        lines.append("")
+        lines.append(f"? {shorten(open_q, 160)}")
+
+    # Reply prompt + minimal id
+    if fm.get("status") == "proposed" and options:
+        reply_labels = "/".join(o.get("label", "?") for o in options[:3])
+        lines.append(f"\nReply: {reply_labels} / no / edit  ·  id …{short_id}")
+    else:
+        lines.append(f"id …{short_id}")
+    return "\n".join(lines)
+
+
+def main() -> int:
+    if len(sys.argv) < 2:
+        print("usage: incident-notify <incident-id|->", file=sys.stderr)
+        return 2
+
+    inc_id = sys.argv[1]
+    if inc_id == "-":
+        inc_id = sys.stdin.read().strip()
+
+    path = find_incident(inc_id)
+    if not path:
+        print(f"not found: {inc_id}", file=sys.stderr)
+        return 1
+
+    fm = parse_fm_full(path.read_text())
+    msg = format_message(fm, path)
+
+    # No-op when no chat is configured: print the message to stderr and succeed.
+    if not DRIFT_CHAT:
+        print("incident-notify skip: HARNESS_TG_CHAT_ID unset", file=sys.stderr)
+        print(msg, file=sys.stderr)
+        return 0
+
+    cmd = [
+        OPENCLAW, "message", "send",
+        "--channel", "telegram",
+        "--account", DRIFT_ACCOUNT,
+        "--target", DRIFT_CHAT,
+        "--thread-id", DRIFT_THREAD,
+        "--message", msg,
+    ]
+    p = subprocess.run(cmd, capture_output=True, text=True)
+    if p.returncode != 0:
+        print(f"send failed: {p.stderr}", file=sys.stderr)
+        return p.returncode
+    stdout = p.stdout.strip()
+    print(stdout or "sent")
+
+    # Capture the Telegram Message ID and store on the incident for reply-to matching.
+    m = re.search(r"Message ID:\s*(\S+)", stdout)
+    if m and m.group(1) != "unknown":
+        msg_id = m.group(1)
+        text = path.read_text()
+        if "notify_msg_id:" in text:
+            text = re.sub(r"^notify_msg_id:.*$", f"notify_msg_id: {msg_id}", text, count=1, flags=re.MULTILINE)
+        else:
+            text = re.sub(r"(^analyzer_model:.*$)", r"\1\nnotify_msg_id: " + msg_id, text, count=1, flags=re.MULTILINE)
+            if "notify_msg_id:" not in text:
+                # Fallback: insert before closing ---
+                text = re.sub(r"\n---\n", f"\nnotify_msg_id: {msg_id}\n---\n", text, count=1)
+        path.write_text(text)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

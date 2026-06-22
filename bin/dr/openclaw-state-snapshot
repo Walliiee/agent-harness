@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+# Part of agent-harness (https://github.com/${GH_ORG}/agent-harness)
+#
+# openclaw-state-snapshot — refresh DR snapshots of OpenClaw scheduler state.
+#
+# Writes:
+#   $DR_BUNDLE_DIR/cron/snapshot.json          (openclaw cron list --all --json)
+#   $DR_BUNDLE_DIR/commitments/snapshot.json   (openclaw commitments list --all --json)
+#
+# Why
+#   The cron snapshot was originally captured manually and never refreshed, so a
+#   future DR rebuild would restore stale schedules. Commitments (open-loop
+#   tracking) had no DR snapshot at all. This script keeps both current.
+#
+# Behavior
+#   Silent on success. If the OpenClaw gateway is unreachable, logs to stderr
+#   and exits 0 (best-effort) so the calling walker hook does NOT block other
+#   component pushes. Hard failures (missing CLI, can't write destination)
+#   exit non-zero.
+#
+# Wiring
+#   Called from the DR sync script (claw-sync-all.sh) in the
+#   sync_dr_bundle_subdirs hook chain.
+#
+# Env:
+#   OPENCLAW_HOME   root of the openclaw install (default ~/.openclaw)
+#   OPENCLAW_BIN    openclaw CLI to invoke (default: openclaw on PATH)
+#   DR_BUNDLE_DIR   destination DR repo (default ~/openclaw-dr-bundle)
+#
+# See: ${OPENCLAW_HOME}/config/README.md (state snapshot section).
+
+set -u
+
+OPENCLAW_HOME="${OPENCLAW_HOME:-$HOME/.openclaw}"
+OPENCLAW="${OPENCLAW_BIN:-openclaw}"
+DEST_ROOT="${DR_BUNDLE_DIR:-$HOME/openclaw-dr-bundle}"
+CRON_DEST="$DEST_ROOT/cron/snapshot.json"
+COMMIT_DEST="$DEST_ROOT/commitments/snapshot.json"
+
+if ! command -v "$OPENCLAW" >/dev/null 2>&1; then
+  echo "openclaw-state-snapshot: CLI not found ($OPENCLAW)" >&2
+  exit 2
+fi
+
+mkdir -p "$(dirname "$CRON_DEST")" "$(dirname "$COMMIT_DEST")" || exit 2
+
+# Atomic write helper: stage to .tmp, validate JSON, mv into place.
+write_atomic(){
+  local dest="$1" content="$2"
+  if ! printf '%s' "$content" | python3 -c 'import json,sys; json.load(sys.stdin)' >/dev/null 2>&1; then
+    echo "openclaw-state-snapshot: invalid JSON for $dest (skipping)" >&2
+    return 1
+  fi
+  local tmp="${dest}.tmp.$$"
+  printf '%s' "$content" > "$tmp" || return 1
+  mv "$tmp" "$dest"
+}
+
+# --- cron snapshot ---------------------------------------------------------
+cron_json=$("$OPENCLAW" cron list --all --json 2>/dev/null) || {
+  echo "openclaw-state-snapshot: cron list failed (gateway down?), skipping" >&2
+  cron_json=""
+}
+if [ -n "$cron_json" ]; then
+  write_atomic "$CRON_DEST" "$cron_json" || true
+fi
+
+# --- commitments snapshot --------------------------------------------------
+commit_json=$("$OPENCLAW" commitments list --all --json 2>/dev/null) || {
+  echo "openclaw-state-snapshot: commitments list failed (gateway down?), skipping" >&2
+  commit_json=""
+}
+if [ -n "$commit_json" ]; then
+  write_atomic "$COMMIT_DEST" "$commit_json" || true
+fi
+
+exit 0

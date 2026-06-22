@@ -1,0 +1,155 @@
+#!/usr/bin/env python3
+"""gbrain-sources-doctor — detect (and optionally fix) drift between the
+declared source->path manifest at ${OPENCLAW_HOME}/config/gbrain-sources.json
+and the live `sources` table in Postgres.
+
+Defends against the 2026-05-14 misconfig class: a rebuild/repair operation
+silently re-registers a source with the wrong local_path. gbrain has no
+`sources update` CLI, so this is the only routine cross-check.
+
+Modes
+-----
+  (no flag)        Detect drift. Silent on clean. Prints one line per drift.
+                   Exit 0 on clean, 1 on any drift.
+  --fix            Auto-correct path drift via direct SQL UPDATE.
+                   Does NOT create/delete sources (those need human review).
+                   Exit 0 if all drift was fixable and fixed, 1 otherwise.
+  --json           Machine-readable output instead of text lines.
+
+Wiring
+------
+  - Manual:        `gbrain-sources-doctor` or `gbrain-sources-doctor --fix`
+  - Scheduled:     Called from ~/.gbrain/postgres-sync-all.sh after dreams-purge.
+                   Silent on clean keeps sync logs quiet; drift surfaces as a
+                   single line + non-zero exit, which the sync wrapper logs.
+
+Detection rules
+---------------
+  PATH_DRIFT          declared.local_path != actual.local_path  → fixable
+  MISSING_IN_DB       declared source not present in DB         → NOT auto-fixed
+  MISSING_IN_MANIFEST unarchived source in DB but not declared  → NOT auto-fixed
+                      (a new legitimate source needs manifest update; the
+                      script flags it so the human notices. Archived sources
+                      absent from the manifest are ignored.)
+  ARCHIVED_LIVE       declared source archived=true in DB       → flagged
+
+See: ${OPENCLAW_HOME}/config/README.md for the operational handbook.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+OPENCLAW_HOME = Path(os.environ.get("OPENCLAW_HOME", os.path.expanduser("~/.openclaw")))
+MANIFEST = OPENCLAW_HOME / "config" / "gbrain-sources.json"
+
+PG_CMD = ["psql", "-U", "gbrain", "-h", "localhost", "-d", "gbrain",
+          "-At", "-F", "|"]
+
+
+def query(sql: str) -> list[list[str]]:
+    res = subprocess.run(PG_CMD + ["-c", sql], capture_output=True, text=True)
+    if res.returncode != 0:
+        print(f"doctor: psql failed: {res.stderr}", file=sys.stderr)
+        sys.exit(2)
+    rows = [line.split("|") for line in res.stdout.strip().split("\n") if line]
+    return rows
+
+
+def execute(sql: str) -> None:
+    res = subprocess.run(PG_CMD + ["-c", sql], capture_output=True, text=True)
+    if res.returncode != 0:
+        raise RuntimeError(f"psql exec failed: {res.stderr}")
+
+
+def load_manifest() -> dict:
+    if not MANIFEST.exists():
+        print(f"doctor: manifest missing: {MANIFEST}", file=sys.stderr)
+        sys.exit(2)
+    data = json.loads(MANIFEST.read_text())
+    return data.get("sources", {})
+
+
+def detect(declared: dict, actual: dict) -> list[dict]:
+    """Return drift records. Each: {kind, id, expected, got, fixable}."""
+    drifts = []
+    for sid, spec in declared.items():
+        expected = spec["local_path"]
+        if sid not in actual:
+            drifts.append({"kind": "MISSING_IN_DB", "id": sid,
+                           "expected": expected, "got": None, "fixable": False})
+            continue
+        got = actual[sid]["local_path"]
+        if got != expected:
+            drifts.append({"kind": "PATH_DRIFT", "id": sid,
+                           "expected": expected, "got": got, "fixable": True})
+        if actual[sid]["archived"]:
+            drifts.append({"kind": "ARCHIVED_LIVE", "id": sid,
+                           "expected": "archived=false", "got": "archived=true",
+                           "fixable": False})
+    for sid, spec in actual.items():
+        if sid not in declared:
+            if spec["archived"]:
+                continue
+            drifts.append({"kind": "MISSING_IN_MANIFEST", "id": sid,
+                           "expected": None,
+                           "got": spec["local_path"], "fixable": False})
+    return drifts
+
+
+def fix_path_drift(d: dict) -> None:
+    sid = d["id"].replace("'", "''")
+    new_path = d["expected"].replace("'", "''")
+    sql = (f"UPDATE sources SET local_path='{new_path}', "
+           f"last_commit=NULL, chunker_version=NULL WHERE id='{sid}';")
+    execute(sql)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--fix", action="store_true",
+                    help="auto-correct path drift via direct SQL")
+    ap.add_argument("--json", action="store_true",
+                    help="machine-readable JSON output")
+    args = ap.parse_args()
+
+    declared = load_manifest()
+    rows = query("SELECT id, local_path, archived FROM sources ORDER BY id;")
+    actual = {r[0]: {"local_path": r[1], "archived": r[2] == "t"} for r in rows}
+
+    drifts = detect(declared, actual)
+
+    if args.fix:
+        fixed = []
+        for d in drifts:
+            if d["kind"] == "PATH_DRIFT":
+                try:
+                    fix_path_drift(d)
+                    fixed.append(d)
+                except Exception as e:
+                    print(f"doctor: FIX FAIL {d['id']}: {e}", file=sys.stderr)
+        if fixed and not args.json:
+            for d in fixed:
+                print(f"FIXED PATH_DRIFT {d['id']}: {d['got']} -> {d['expected']}")
+        # Re-detect after fix
+        rows = query("SELECT id, local_path, archived FROM sources ORDER BY id;")
+        actual = {r[0]: {"local_path": r[1], "archived": r[2] == "t"} for r in rows}
+        drifts = detect(declared, actual)
+
+    if args.json:
+        print(json.dumps({"drifts": drifts}, indent=2))
+    else:
+        for d in drifts:
+            print(f"DRIFT {d['kind']} {d['id']}: "
+                  f"expected={d['expected']!r} got={d['got']!r}")
+
+    return 0 if not drifts else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

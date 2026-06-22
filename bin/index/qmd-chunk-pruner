@@ -1,0 +1,263 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Part of agent-harness (https://github.com/${GH_ORG}/agent-harness)
+"""qmd-chunk-pruner — purge orphan chunk/vector rows from QMD indices.
+
+Companion to qmd-prune (doc-level). This script catches chunk-level rot that
+accumulates because QMD's cascade isn't automatic between content/content_vectors
+/vectors_vec when content rows are deleted.
+
+Two classes of stale state at the chunk layer:
+  1. orphan-content: content.hash with no active document referencing it.
+     Accumulates when documents are deleted out-of-band (rare) or by qmd-prune.
+  2. orphan-content-vectors: content_vectors.hash with no matching content row.
+     Accumulates the same way; not cascaded.
+
+For each orphan content_vectors row, the matching vectors_vec virtual-table
+row (keyed by hash_seq = hash || '_' || seq) is also deleted, which cascades
+through vectors_vec_rowids/chunks/vector_chunks00 via vec0.
+
+Run AFTER qmd-prune in any pruning cycle, since qmd-prune may create new orphans
+by deleting documents.
+
+Usage:
+  qmd-chunk-pruner                # dry-run report across all configured agents
+  qmd-chunk-pruner --apply        # actually delete
+  qmd-chunk-pruner --agent main   # scope to one agent
+  qmd-chunk-pruner --json         # machine-readable report
+
+Exit codes:
+  0 — clean OR --apply succeeded
+  1 — orphan rows found in dry-run mode
+  2 — error
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import sqlite3
+import sys
+from datetime import datetime
+from pathlib import Path
+
+OPENCLAW_HOME = Path(os.environ.get("OPENCLAW_HOME", os.path.expanduser("~/.openclaw")))
+
+
+def _load_agents_map():
+    """Return list of (agent_id, workspace_dir, persona) from config/agents.map."""
+    here = Path(__file__).resolve()
+    candidates = []
+    env_map = os.environ.get("AGENTS_MAP")
+    if env_map:
+        candidates.append(Path(env_map))
+    candidates.append(OPENCLAW_HOME / "config" / "agents.map")
+    candidates.append(here.parent.parent.parent / "config" / "agents.map")
+    for c in candidates:
+        try:
+            if c.is_file():
+                rows = []
+                for line in c.read_text(encoding="utf-8").splitlines():
+                    line = line.split("#", 1)[0].strip()
+                    if not line:
+                        continue
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        rows.append((parts[0], parts[1], parts[2]))
+                if rows:
+                    return rows
+        except OSError:
+            continue
+    return [("main", "workspace", "Orchestrator"), ("dev", "workspace-dev", "Developer")]
+
+
+AGENTS = [aid for aid, _ws, _p in _load_agents_map()]
+
+# vec0 SQLite extension shipped by qmd's npm dependency. Required because the
+# vectors_vec virtual table can't be opened without it; even a DELETE against
+# the table fails with "no such module: vec0".
+VEC0_CANDIDATES = [
+    Path.home() / ".bun/install/global/node_modules/sqlite-vec-darwin-arm64/vec0.dylib",
+    OPENCLAW_HOME / "npm/node_modules/openclaw/node_modules/sqlite-vec-darwin-arm64/vec0.dylib",
+]
+
+
+def find_vec0() -> Path:
+    for p in VEC0_CANDIDATES:
+        if p.exists():
+            return p
+    raise SystemExit("error: vec0.dylib not found in known locations")
+
+
+def open_with_vec0(db: Path) -> sqlite3.Connection:
+    con = sqlite3.connect(str(db))
+    con.enable_load_extension(True)
+    con.load_extension(str(find_vec0()))
+    con.enable_load_extension(False)
+    return con
+
+
+def agent_db(agent: str) -> Path:
+    return OPENCLAW_HOME / "agents" / agent / "qmd" / "xdg-cache" / "qmd" / "index.sqlite"
+
+
+def scan_agent(agent: str) -> dict:
+    db = agent_db(agent)
+    if not db.exists():
+        return {"agent": agent, "skipped": "no-db"}
+    con = open_with_vec0(db)
+    cur = con.cursor()
+
+    cur.execute("SELECT COUNT(*) FROM documents WHERE active=1")
+    docs_active = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM content")
+    content_total = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM content_vectors")
+    cv_total = cur.fetchone()[0]
+
+    # Orphan = no document at all references this hash (active or inactive).
+    # Inactive docs are tombstones we intentionally keep; their content stays.
+    cur.execute(
+        "SELECT COUNT(*) FROM content c "
+        "WHERE NOT EXISTS (SELECT 1 FROM documents d WHERE d.hash = c.hash)"
+    )
+    orphan_content = cur.fetchone()[0]
+
+    cur.execute(
+        "SELECT COUNT(*) FROM content_vectors cv "
+        "WHERE NOT EXISTS (SELECT 1 FROM content c WHERE c.hash = cv.hash)"
+    )
+    orphan_cv = cur.fetchone()[0]
+
+    con.close()
+    return {
+        "agent": agent,
+        "docs_active": docs_active,
+        "content_total": content_total,
+        "content_vectors_total": cv_total,
+        "orphan_content": orphan_content,
+        "orphan_content_vectors": orphan_cv,
+    }
+
+
+def apply_agent(agent: str) -> dict:
+    db = agent_db(agent)
+    backup = db.with_suffix(f".sqlite.bak-chunk-{datetime.now().strftime('%Y%m%d-%H%M%S')}")
+    shutil.copy2(db, backup)
+
+    con = open_with_vec0(db)
+    cur = con.cursor()
+
+    # Step 1: collect orphan content_vectors hash_seq ids, drop the matching
+    # vectors_vec rows first (vec0 cascades through its internal tables).
+    cur.execute(
+        "SELECT hash, seq FROM content_vectors cv "
+        "WHERE NOT EXISTS (SELECT 1 FROM content c WHERE c.hash = cv.hash)"
+    )
+    orphan_cv_rows = cur.fetchall()
+    vec_deleted = 0
+    if orphan_cv_rows:
+        ids = [f"{h}_{s}" for h, s in orphan_cv_rows]
+        # vectors_vec is a vec0 virtual table; DELETE by hash_seq cascades.
+        chunk = 500
+        for i in range(0, len(ids), chunk):
+            batch = ids[i : i + chunk]
+            placeholders = ",".join("?" * len(batch))
+            cur.execute(
+                f"DELETE FROM vectors_vec WHERE hash_seq IN ({placeholders})",
+                batch,
+            )
+            vec_deleted += cur.rowcount
+
+    # Step 2: drop the content_vectors rows themselves.
+    cur.execute(
+        "DELETE FROM content_vectors WHERE hash NOT IN (SELECT hash FROM content)"
+    )
+    cv_deleted = cur.rowcount
+
+    # Step 3: drop content rows that no live document references.
+    # Note: documents.hash has FK to content with ON DELETE CASCADE, which
+    # is the wrong direction for our case (deleting content would nuke any
+    # remaining documents). So we only delete content rows that have NO
+    # referencing documents at all.
+    cur.execute(
+        "DELETE FROM content WHERE hash NOT IN (SELECT DISTINCT hash FROM documents)"
+    )
+    content_deleted = cur.rowcount
+
+    con.commit()
+    cur.execute("VACUUM")
+    con.close()
+
+    return {
+        "backup": str(backup),
+        "vectors_vec_deleted": vec_deleted,
+        "content_vectors_deleted": cv_deleted,
+        "content_deleted": content_deleted,
+    }
+
+
+def format_report(reports: list[dict], applied: dict[str, dict] | None) -> str:
+    lines = []
+    total_oc = 0
+    total_ocv = 0
+    for r in reports:
+        if r.get("skipped"):
+            lines.append(f"{r['agent']:15s} : SKIPPED ({r['skipped']})")
+            continue
+        lines.append(
+            f"{r['agent']:15s} : docs={r['docs_active']:5d}  "
+            f"content={r['content_total']:5d} (orphan {r['orphan_content']:4d})  "
+            f"content_vectors={r['content_vectors_total']:5d} (orphan {r['orphan_content_vectors']:5d})"
+        )
+        total_oc += r["orphan_content"]
+        total_ocv += r["orphan_content_vectors"]
+        if applied and r["agent"] in applied:
+            a = applied[r["agent"]]
+            lines.append(
+                f"  → APPLIED: vectors_vec_deleted={a['vectors_vec_deleted']} "
+                f"content_vectors_deleted={a['content_vectors_deleted']} "
+                f"content_deleted={a['content_deleted']}"
+            )
+            lines.append(f"    backup: {a['backup']}")
+    lines.append("")
+    lines.append(f"TOTAL: {total_oc} orphan content, {total_ocv} orphan content_vectors")
+    return "\n".join(lines)
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(prog="qmd-chunk-pruner")
+    p.add_argument("--agent", choices=AGENTS, help="scope to one agent (default: all)")
+    p.add_argument("--apply", action="store_true", help="actually delete; default is dry-run")
+    p.add_argument("--json", action="store_true", help="machine-readable output")
+    args = p.parse_args()
+
+    targets = [args.agent] if args.agent else AGENTS
+    reports = [scan_agent(a) for a in targets]
+    total_stale = sum(
+        r.get("orphan_content", 0) + r.get("orphan_content_vectors", 0) for r in reports
+    )
+
+    applied = None
+    if args.apply and total_stale > 0:
+        applied = {}
+        for r in reports:
+            if r.get("skipped"):
+                continue
+            if r["orphan_content"] == 0 and r["orphan_content_vectors"] == 0:
+                continue
+            applied[r["agent"]] = apply_agent(r["agent"])
+
+    if args.json:
+        print(json.dumps({"reports": reports, "applied": applied}, indent=2))
+    else:
+        print(format_report(reports, applied))
+
+    if args.apply:
+        return 0
+    return 1 if total_stale > 0 else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

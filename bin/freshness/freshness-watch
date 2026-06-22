@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# freshness-watch — wrapper that runs both freshness emitters weekly.
+#
+# Conservative cap (10 each) per run to avoid Drift notification flood. The
+# emitters dedup by key so repeat-runs don't re-emit the same incident if
+# upstream incidents are still open/proposed.
+#
+# Invoked by a weekly scheduler (e.g. a LaunchAgent / cron, Sundays 05:00).
+
+set -u
+export HOME="${HOME:-$(echo ~)}"
+OPENCLAW_HOME="${OPENCLAW_HOME:-$HOME/.openclaw}"
+export PATH="/usr/local/bin:/opt/homebrew/bin:$HOME/.bun/bin:$HOME/.local/bin:/usr/bin:/bin"
+
+BIN="$OPENCLAW_HOME/bin/freshness"
+LOG="$OPENCLAW_HOME/incidents/freshness-watch.log"
+
+mkdir -p "$(dirname "$LOG")"
+
+echo "=== freshness-watch $(date -u +%Y-%m-%dT%H:%M:%SZ) ===" >> "$LOG"
+"$BIN/time-marker-watch" --commit --max 10 >> "$LOG" 2>&1
+"$BIN/reference-rot-watch" --commit --max 10 >> "$LOG" 2>&1
+
+# Round 1.5: auto-triage stale-file incidents we're confident about. Conservative
+# allowlist + zero-backlink + LLM content-judge gate at confidence>=0.90. Anything
+# that doesn't pass both gates remains status=open for the normal analyze→notify
+# path. Capped at 10/run.
+echo "--- freshness-auto-triage ---" >> "$LOG"
+"$BIN/freshness-auto-triage" --commit --max 10 >> "$LOG" 2>&1
+echo "" >> "$LOG"

@@ -1,0 +1,161 @@
+#!/usr/bin/env python3
+"""Pre-archive guard + stale-slug audit for ~/.gbrain/evals/golden.ndjson.
+
+Two modes:
+
+  goldens-affecting <slug>
+      Print golden entries whose expected_top_slugs include <slug>.
+      Use BEFORE archiving/moving a brain page: if matches exist, update or
+      archive the golden first; otherwise the next nightly eval will alarm.
+
+  goldens-affecting --audit
+      Scan every golden's expected_top_slugs against the current brain and
+      report any that no longer resolve (in any source). Read-only.
+
+Examples:
+  goldens-affecting audits/harness-engineering-audit-2026-05-08
+  goldens-affecting --audit
+  goldens-affecting --audit --json
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+GOLDEN = Path(os.environ.get("GBRAIN_GOLDEN", str(Path.home() / ".gbrain" / "evals" / "golden.ndjson")))
+GBRAIN = os.environ.get("GBRAIN_BIN", str(Path.home() / ".bun" / "bin" / "gbrain"))
+DB_URL = os.environ.get("GBRAIN_DATABASE_URL", "postgresql://gbrain@localhost:5432/gbrain")
+PSQL = os.environ.get("PSQL_BIN", "psql")
+
+
+def load_entries() -> list[dict]:
+    if not GOLDEN.exists():
+        print(f"ERROR: {GOLDEN} not found", file=sys.stderr)
+        sys.exit(2)
+    entries = []
+    with GOLDEN.open() as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            entries.append(json.loads(line))
+    return entries
+
+
+def affecting(slug: str, entries: list[dict]) -> list[dict]:
+    """Goldens whose expected_top_slugs include the given slug."""
+    out = []
+    for e in entries:
+        if e.get("status") == "archived":
+            continue
+        if slug in (e.get("expected_top_slugs") or []):
+            out.append(e)
+    return out
+
+
+def slug_resolves(slug: str, expected_source: str | None = None) -> bool:
+    """Direct DB lookup; source-aware when expected_source is provided.
+
+    Honors the golden's expected_source field: a slug in a non-default source is
+    NOT stale just because get_page (which is default-source-only) misses it.
+    Falls back to any-source lookup when expected_source is missing.
+
+    Uses psql via stdin with \\set so values are escaped through psql's
+    variable layer — no shell-quoting risk.
+    """
+    if expected_source:
+        sql = (
+            f"\\set slug '{_pq_lit(slug)}'\n"
+            f"\\set src '{_pq_lit(expected_source)}'\n"
+            "SELECT 1 FROM pages WHERE slug = :'slug' "
+            "AND source_id = :'src' AND deleted_at IS NULL LIMIT 1;\n"
+        )
+    else:
+        sql = (
+            f"\\set slug '{_pq_lit(slug)}'\n"
+            "SELECT 1 FROM pages WHERE slug = :'slug' "
+            "AND deleted_at IS NULL LIMIT 1;\n"
+        )
+    p = subprocess.run(
+        [PSQL, DB_URL, "-A", "-t", "-q"],
+        input=sql, capture_output=True, text=True, timeout=10,
+    )
+    return p.returncode == 0 and p.stdout.strip() == "1"
+
+
+def _pq_lit(s: str) -> str:
+    """Escape single-quotes for psql \\set 'value' form."""
+    return s.replace("'", "''")
+
+
+def audit(entries: list[dict]) -> list[dict]:
+    """Return list of stale (entry_id, slug) records."""
+    stale = []
+    cache: dict[tuple[str, str | None], bool] = {}
+    for e in entries:
+        if e.get("status") == "archived":
+            continue
+        src = e.get("expected_source")
+        for slug in e.get("expected_top_slugs") or []:
+            key = (slug, src)
+            if key not in cache:
+                cache[key] = slug_resolves(slug, src)
+            if not cache[key]:
+                stale.append({"golden_id": e["id"], "slug": slug, "expected_source": src})
+    return stale
+
+
+def main():
+    p = argparse.ArgumentParser(prog="goldens-affecting", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("slug", nargs="?", help="slug to check; alternatively use --audit")
+    p.add_argument("--audit", action="store_true", help="scan all goldens for stale slugs")
+    p.add_argument("--json", action="store_true", help="JSON output")
+    args = p.parse_args()
+
+    entries = load_entries()
+
+    if args.audit:
+        stale = audit(entries)
+        if args.json:
+            print(json.dumps({"stale": stale, "count": len(stale)}, indent=2))
+            return 0 if not stale else 1
+        if not stale:
+            print(f"OK — {len(entries)} goldens scanned, all expected slugs resolve.")
+            return 0
+        print(f"STALE — {len(stale)} stale slug(s) across {len(set(s['golden_id'] for s in stale))} golden entries:")
+        for s in stale:
+            src = f" (expected_source={s['expected_source']})" if s.get('expected_source') else ""
+            print(f"  {s['golden_id']:34s}  → {s['slug']}{src}")
+        print()
+        print("Action: update the golden's expected_top_slugs to the page's new path,")
+        print("        archive the golden (status: archived), or restore the page.")
+        return 1
+
+    if not args.slug:
+        p.error("provide a slug, or use --audit")
+
+    matches = affecting(args.slug, entries)
+    if args.json:
+        print(json.dumps({"slug": args.slug, "matches": matches, "count": len(matches)}, indent=2))
+        return 0 if not matches else 1
+    if not matches:
+        print(f"No goldens reference {args.slug!r} — safe to archive/move.")
+        return 0
+    print(f"PINNED by {len(matches)} golden(s):")
+    for e in matches:
+        src = f" (expected_source={e.get('expected_source')})" if e.get('expected_source') else ""
+        print(f"  {e['id']:34s}  status={e.get('status','?'):20s}{src}")
+        print(f"    query: {e.get('query','?')}")
+    print()
+    print(f"Before archiving {args.slug}: update the affected golden(s) to the new path,")
+    print(f"or mark them status=archived if the underlying need is gone.")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

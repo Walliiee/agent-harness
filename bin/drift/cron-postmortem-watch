@@ -1,0 +1,577 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Part of agent-harness (https://github.com/${GH_ORG}/agent-harness)
+"""Cron post-mortem watcher.
+
+Scans `openclaw cron runs --id <jobId>` history for every cron and emits an incident
+for each failed run not yet recorded. Idempotent: keyed on (jobId, run_ts).
+
+Why history (not current state): `openclaw cron list` only surfaces the *latest* status.
+A failure on day N gets masked once day N+1 succeeds, but the incident still matters
+because it shows a recurring failure pattern. Reading `cron runs` recovers all failures
+within the history window.
+"""
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+OPENCLAW_HOME = Path(os.environ.get("OPENCLAW_HOME", os.path.expanduser("~/.openclaw")))
+
+INCIDENT_CLI = os.environ.get("INCIDENT_CLI", str(OPENCLAW_HOME / "bin" / "incident"))
+ANALYZE_CLI = os.environ.get("ANALYZE_CLI", str(OPENCLAW_HOME / "bin" / "incident-analyze"))
+NOTIFY_CLI = os.environ.get("NOTIFY_CLI", str(OPENCLAW_HOME / "bin" / "incident-notify"))
+RETRY_CLI = os.environ.get("RETRY_CLI", str(OPENCLAW_HOME / "bin" / "incident-retry"))
+OPENCLAW = os.environ.get("OPENCLAW_BIN", "openclaw")
+STATE_FILE = OPENCLAW_HOME / "incidents" / "state.json"
+SKILL_RUNS_DIR = OPENCLAW_HOME / "skill-runs"
+
+
+def _load_agents_map():
+    """Return list of (agent_id, workspace_dir, persona) from config/agents.map."""
+    here = Path(__file__).resolve()
+    candidates = []
+    env_map = os.environ.get("AGENTS_MAP")
+    if env_map:
+        candidates.append(Path(env_map))
+    candidates.append(OPENCLAW_HOME / "config" / "agents.map")
+    candidates.append(here.parent.parent.parent / "config" / "agents.map")
+    for c in candidates:
+        try:
+            if c.is_file():
+                rows = []
+                for line in c.read_text(encoding="utf-8").splitlines():
+                    line = line.split("#", 1)[0].strip()
+                    if not line:
+                        continue
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        rows.append((parts[0], parts[1], parts[2]))
+                if rows:
+                    return rows
+        except OSError:
+            continue
+    return [("main", "workspace", "Orchestrator"), ("dev", "workspace-dev", "Developer")]
+
+
+AGENTS = _load_agents_map()
+# Cron agentId → skill-runs agent name. Crons identify agents by their session-target
+# name (agent-id); skill-runs records use the persona label from agents.map.
+AGENT_MAP = {aid: persona for aid, _ws, persona in AGENTS}
+
+# Window (seconds) around the cron's run_at_ms within which a matching skill-run
+# record's started_at must fall to be considered the same execution.
+# 600s default covers LLM-instrumented skills that run for several minutes between
+# skill-run start and any later cron-reported failure. Override via env.
+RUN_ID_MATCH_WINDOW_SEC = int(os.environ.get("CROSS_LINK_WINDOW_SEC", "600"))
+HISTORY_LIMIT = int(os.environ.get("CRON_HISTORY_LIMIT", "50"))
+NOTIFY_ENABLED = os.environ.get("DRIFT_NOTIFY", "1") not in ("0", "false", "no")
+ANALYZE_ENABLED = os.environ.get("DRIFT_ANALYZE", "1") not in ("0", "false", "no")
+RETRY_ENABLED = os.environ.get("DRIFT_RETRY", "1") not in ("0", "false", "no")
+RETRY_TIMEOUT_S = int(os.environ.get("DRIFT_RETRY_WATCHER_TIMEOUT", "700"))
+RESUME_ENABLED = os.environ.get("DRIFT_RESUME", "1") not in ("0", "false", "no")
+RESUME_CLI = str(OPENCLAW_HOME / "bin" / "cron-resume")
+RESUME_TIMEOUT_S = int(os.environ.get("DRIFT_RESUME_TIMEOUT", "120"))
+
+
+def run(cmd: list[str], timeout: int = 30) -> tuple[int, str, str]:
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    return p.returncode, p.stdout, p.stderr
+
+
+def load_state() -> dict:
+    if not STATE_FILE.exists():
+        return {"schema_version": 1, "sources": {"cron": {"per_job": {}}}}
+    s = json.loads(STATE_FILE.read_text())
+    s.setdefault("sources", {}).setdefault("cron", {}).setdefault("per_job", {})
+    return s
+
+
+def save_state(s: dict) -> None:
+    STATE_FILE.write_text(json.dumps(s, indent=2) + "\n")
+
+
+def find_matching_run_id(cron_agent_id: str | None, run_at_ms: int) -> str | None:
+    """Look up the skill-runs ledger for a record matching this cron execution.
+
+    Match criteria:
+      - agent equals the mapped skill-runs name
+      - started_at within +/- RUN_ID_MATCH_WINDOW_SEC of run_at_ms
+
+    Returns the closest-by-time matching run_id, or None if no match.
+    """
+    if not cron_agent_id or not SKILL_RUNS_DIR.exists():
+        return None
+    target_agent = AGENT_MAP.get(cron_agent_id)
+    if not target_agent:
+        return None
+
+    import re as _re
+    cron_dt = datetime.fromtimestamp(run_at_ms / 1000, tz=timezone.utc)
+    # Cron run might span the day boundary; check today's dir + neighbours.
+    candidate_days = {
+        cron_dt.strftime("%Y-%m-%d"),
+        (cron_dt - timedelta(seconds=RUN_ID_MATCH_WINDOW_SEC)).strftime("%Y-%m-%d"),
+        (cron_dt + timedelta(seconds=RUN_ID_MATCH_WINDOW_SEC)).strftime("%Y-%m-%d"),
+    }
+    best_run_id: str | None = None
+    best_delta: float | None = None
+
+    for day in candidate_days:
+        day_dir = SKILL_RUNS_DIR / day
+        if not day_dir.is_dir():
+            continue
+        for f in day_dir.glob("*.md"):
+            try:
+                text = f.read_text()
+            except OSError:
+                continue
+            agent_m = _re.search(r"^agent:\s*(\S+)", text, _re.MULTILINE)
+            started_m = _re.search(r'^started_at:\s*"?([\d\-T:Z]+)"?', text, _re.MULTILINE)
+            run_id_m = _re.search(r"^run_id:\s*(\S+)", text, _re.MULTILINE)
+            if not (agent_m and started_m and run_id_m):
+                continue
+            if agent_m.group(1).strip() != target_agent:
+                continue
+            try:
+                started_dt = datetime.strptime(started_m.group(1).strip(), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
+            delta = abs((started_dt - cron_dt).total_seconds())
+            if delta > RUN_ID_MATCH_WINDOW_SEC:
+                continue
+            if best_delta is None or delta < best_delta:
+                best_delta = delta
+                best_run_id = run_id_m.group(1).strip()
+    return best_run_id
+
+
+def iso(ms: int | None) -> str | None:
+    if not ms:
+        return None
+    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def list_jobs() -> list[dict]:
+    code, out, err = run([OPENCLAW, "cron", "list", "--json"], timeout=30)
+    if code != 0:
+        raise RuntimeError(f"openclaw cron list failed: {err.strip() or out.strip()}")
+    return json.loads(out).get("jobs", [])
+
+
+def fetch_runs(job_id: str, limit: int = HISTORY_LIMIT) -> list[dict]:
+    code, out, err = run([OPENCLAW, "cron", "runs", "--id", job_id, "--limit", str(limit)], timeout=30)
+    if code != 0:
+        print(f"WARN: cron runs failed for {job_id}: {err.strip()}", file=sys.stderr)
+        return []
+    out = out.strip()
+    if not out:
+        return []
+    try:
+        data = json.loads(out)
+    except json.JSONDecodeError:
+        return []
+    if isinstance(data, dict):
+        return data.get("entries") or data.get("runs") or []
+    if isinstance(data, list):
+        return data
+    return []
+
+
+def is_run_failed(run_entry: dict) -> bool:
+    s = (run_entry.get("status") or "").lower()
+    return s in ("error", "fail", "failed", "timeout")
+
+
+def severity_for(run_entry: dict, prior_failures_in_window: int,
+                 ollama_cloud_cluster_size: int = 0) -> str:
+    """Compute severity. Layered rules:
+
+    - "no available auth profile" → high (dead-fallback / config-debt; primary
+      timeout compounded by an unauthenticated fallback, no recovery possible).
+    - ollama_cloud_cluster_size >= 2 → high (provider-level outage signal;
+      multiple distinct crons timing out on ollama/*:cloud within 1 hour).
+    - "timeout" in err or prior_failures_in_window >= 3 → high.
+    - prior_failures_in_window >= 1 → med.
+    - else low.
+    """
+    err = (run_entry.get("error") or "").lower()
+    if "no available auth profile" in err:
+        return "high"
+    if ollama_cloud_cluster_size >= 2:
+        return "high"
+    if "timeout" in err or prior_failures_in_window >= 3:
+        return "high"
+    if prior_failures_in_window >= 1:
+        return "med"
+    return "low"
+
+
+def try_resume(cron_id: str, run_at_ms: int, reason: str = "gateway-restart") -> dict:
+    """Invoke cron-resume; return {resumed, exit_code, message}. Failures are
+    swallowed — resume is best-effort. Caller uses result for body/log only."""
+    if not RESUME_ENABLED:
+        return {"resumed": False, "exit_code": -1, "message": "resume disabled"}
+    try:
+        p = subprocess.run(
+            [RESUME_CLI, cron_id, str(run_at_ms), "--reason", reason],
+            capture_output=True, text=True, timeout=RESUME_TIMEOUT_S,
+        )
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return {"resumed": False, "exit_code": -2, "message": f"resume invoke failed: {e}"}
+    if p.returncode == 0:
+        try:
+            data = json.loads(p.stdout)
+            return {"resumed": bool(data.get("resumed")), "exit_code": 0,
+                    "message": "resumed", "detail": data}
+        except (json.JSONDecodeError, ValueError):
+            return {"resumed": False, "exit_code": 0, "message": "resume returned 0 but no json"}
+    # Non-zero: exit codes are documented in cron-resume.
+    return {"resumed": False, "exit_code": p.returncode, "message": (p.stderr or "").strip()}
+
+
+def build_ollama_cloud_cluster(jobs: list[dict], runs_by_job: dict[str, list[dict]],
+                                window_ms: int = 3600_000) -> dict[str, set[str]]:
+    """Build a map: model → set(cron_ids) that timed out on that model in the
+    last `window_ms`. Used to elevate severity when ≥2 distinct crons hit the
+    same ollama/*:cloud model within an hour (provider-outage signal).
+    """
+    import time
+    now_ms = int(time.time() * 1000)
+    cutoff = now_ms - window_ms
+    cluster: dict[str, set[str]] = {}
+    for job in jobs:
+        job_id = job["id"]
+        for r in runs_by_job.get(job_id, []):
+            ts = r.get("ts") or r.get("runAtMs") or 0
+            if ts < cutoff:
+                continue
+            err = (r.get("error") or "").lower()
+            if "timeout" not in err:
+                continue
+            model = r.get("model") or (job.get("payload") or {}).get("model") or ""
+            if not (model.startswith("ollama/") and ":cloud" in model):
+                continue
+            cluster.setdefault(model, set()).add(job_id)
+    return cluster
+
+
+def main() -> int:
+    try:
+        jobs = list_jobs()
+    except Exception as e:
+        print(f"FATAL: {e}", file=sys.stderr)
+        return 2
+
+    state = load_state()
+    per_job = state["sources"]["cron"]["per_job"]
+
+    emitted = 0
+    skipped = 0
+    scanned_runs = 0
+    resumed_total = 0
+
+    # First pass: fetch all runs per job so we can build a cross-job 1-hour
+    # window for ollama-cloud-outage cluster detection. Sacrifices one extra
+    # in-memory pass for a meaningful provider-outage severity signal.
+    runs_by_job: dict[str, list[dict]] = {}
+    for job in jobs:
+        runs_by_job[job["id"]] = fetch_runs(job["id"])
+    ollama_cluster = build_ollama_cloud_cluster(jobs, runs_by_job)
+
+    # Pre-pass 2: detect gateway-restart clusters (≥2 crons interrupted within
+    # a 60-sec window share a single root cause — emit one cluster incident
+    # instead of N per-cron incidents).
+    gateway_buckets: dict[int, list[tuple[dict, dict]]] = {}
+    for job in jobs:
+        job_id = job["id"]
+        last_seen_ts = (per_job.get(job_id) or {}).get("last_seen_ts") or 0
+        for r in runs_by_job.get(job_id, []):
+            ts = r.get("ts") or r.get("runAtMs") or 0
+            if ts <= last_seen_ts or not is_run_failed(r):
+                continue
+            err = (r.get("error") or "").lower()
+            if "gateway restart" not in err:
+                continue
+            bucket = ts // 60_000
+            gateway_buckets.setdefault(bucket, []).append((job, r))
+    # Mark cluster members so the per-cron loop skips them.
+    clustered_runs: set[tuple[str, int]] = set()
+    gateway_clusters: list[tuple[int, list[tuple[dict, dict]]]] = []
+    for bucket, members in gateway_buckets.items():
+        if len(members) < 2:
+            continue
+        gateway_clusters.append((bucket * 60_000, members))
+        for job, r in members:
+            ts = r.get("ts") or r.get("runAtMs") or 0
+            clustered_runs.add((job["id"], ts))
+
+    for job in jobs:
+        job_id = job["id"]
+        runs_entries = runs_by_job.get(job_id, [])
+        scanned_runs += len(runs_entries)
+        if not runs_entries:
+            continue
+
+        last_seen_ts = (per_job.get(job_id) or {}).get("last_seen_ts") or 0
+        failures = [r for r in runs_entries if is_run_failed(r)]
+
+        # Sort failures oldest-first so we emit in chronological order.
+        failures.sort(key=lambda r: r.get("ts") or r.get("runAtMs") or 0)
+
+        new_failures = [r for r in failures if (r.get("ts") or r.get("runAtMs") or 0) > last_seen_ts]
+        skipped += len(failures) - len(new_failures)
+
+        # Count failures-in-window for severity grading.
+        for idx, r in enumerate(new_failures):
+            ts = r.get("ts") or r.get("runAtMs") or 0
+            run_at_ms = r.get("runAtMs") or ts
+            run_iso = iso(run_at_ms)
+
+            # Coalesced gateway-restart cluster: skip per-cron emit; the cluster
+            # incident emitted after the main loop covers this run.
+            if (job_id, ts) in clustered_runs:
+                per_job[job_id] = {
+                    "last_seen_ts": ts,
+                    "last_emitted_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "last_incident_id": "cluster:pending",
+                }
+                skipped += 1
+                continue
+
+            dedup_key = f"cron-{job_id}-{ts}"
+            title = f"{job.get('name', job_id)}: {(r.get('error') or 'failed')[:80]}"
+
+            raw_lines = [
+                f"# Cron failure: {job.get('name', job_id)}",
+                f"job_id: {job_id}",
+                f"agent: {job.get('agentId')}",
+                f"schedule: {(job.get('schedule') or {}).get('expr')} @ {(job.get('schedule') or {}).get('tz')}",
+                f"run_at: {run_iso}",
+                f"duration_ms: {r.get('durationMs')}",
+                f"status: {r.get('status')}",
+                f"error: {r.get('error')}",
+                "",
+                "## Diagnostics",
+                json.dumps(r.get("diagnostics") or {}, indent=2),
+                "",
+                "## Full run entry",
+                json.dumps(r, indent=2),
+                "",
+                "## Job payload (truncated)",
+                json.dumps((job.get("payload") or {}), indent=2)[:4000],
+            ]
+
+            fields = {
+                "job_id": job_id,
+                "agent_id": job.get("agentId"),
+                "cron_name": job.get("name"),
+                "run_at": run_iso,
+                "run_ts_ms": ts,
+                "duration_ms": r.get("durationMs"),
+                "error_excerpt": (r.get("error") or "")[:200],
+                "schedule": (job.get("schedule") or {}).get("expr"),
+                "model": r.get("model") or (job.get("payload") or {}).get("model"),
+            }
+            related = {
+                "cron_id": job_id,
+                "cron_name": job.get("name"),
+                "session_id": r.get("sessionId"),
+            }
+
+            model = r.get("model") or (job.get("payload") or {}).get("model") or ""
+            cluster_size = 0
+            if model.startswith("ollama/") and ":cloud" in model:
+                cluster_size = len(ollama_cluster.get(model, set()))
+            # Singleton gateway-restart: try resume here (the cluster pass
+            # handled the multi-cron case; this catches lone restarts).
+            err_lower = (r.get("error") or "").lower()
+            singleton_resume = None
+            if "gateway restart" in err_lower:
+                singleton_resume = try_resume(job_id, ts, reason="gateway-restart-singleton")
+                if singleton_resume.get("resumed"):
+                    resumed_total += 1
+            emit_cmd = [
+                INCIDENT_CLI, "emit",
+                "--source", "cron",
+                "--severity", severity_for(r, idx, cluster_size),
+                "--title", title,
+                "--agent", job.get("agentId") or "unknown",
+                "--key", dedup_key,
+                "--fields-json", json.dumps(fields),
+                "--related-json", json.dumps(related),
+            ]
+            matched_run_id = find_matching_run_id(job.get("agentId"), run_at_ms)
+            if matched_run_id:
+                emit_cmd += ["--run-id", matched_run_id]
+            p = subprocess.run(emit_cmd, input="\n".join(raw_lines), capture_output=True, text=True)
+            if p.returncode != 0:
+                print(f"WARN: emit failed for {job_id}@{ts}: {p.stderr}", file=sys.stderr)
+                continue
+            was_dedup = "DEDUP:" in (p.stderr or "")
+            if was_dedup:
+                skipped += 1
+            else:
+                emitted += 1
+                inc_id = p.stdout.strip()
+                recovered = False
+                auto_applied = False
+
+                # Loop 2: try corrective retry FIRST for tool-misuse failures (file-edit-mismatch,
+                # write-on-existing, read-failed). Model-swap doesn't fix tool discipline; an LLM
+                # teaching the failing pattern "read first, then edit" — with the actual error in
+                # context — does. If retry recovers, we skip analyze+notify entirely.
+                if RETRY_ENABLED:
+                    rr = subprocess.run([RETRY_CLI, inc_id], capture_output=True, text=True, timeout=RETRY_TIMEOUT_S)
+                    if rr.returncode == 0:
+                        try:
+                            recovered = bool(json.loads(rr.stdout).get("recovered"))
+                        except (json.JSONDecodeError, ValueError):
+                            recovered = False
+                    # returncode 2 = not tool-misuse / retry failed — fall through to analyze.
+                    # returncode 1 = lookup failure — log and fall through.
+                    elif rr.returncode == 1:
+                        print(f"WARN: retry lookup failed for {inc_id}: {rr.stderr}", file=sys.stderr)
+
+                # Loop 1: judge-gated auto-apply for everything else.
+                if not recovered and ANALYZE_ENABLED:
+                    a = subprocess.run([ANALYZE_CLI, "--auto-safe", inc_id], capture_output=True, text=True, timeout=300)
+                    if a.returncode != 0:
+                        print(f"WARN: analyze failed for {inc_id}: {a.stderr}", file=sys.stderr)
+                    else:
+                        try:
+                            parsed = json.loads(a.stdout)
+                            asa = parsed.get("auto_safe_apply")
+                            # auto_applied means: incident-apply was actually invoked.
+                            # If judge declined, asa is {"judge_declined": True, ...} → still notify.
+                            auto_applied = bool(asa and not asa.get("judge_declined"))
+                        except (json.JSONDecodeError, ValueError):
+                            auto_applied = False
+
+                # Skip notify when recovered (retry posted its own ack) or auto-applied
+                # (incident-apply posted its own ack). When judge declined, we still want a
+                # Drift message — now carrying the judge's reasoning at the top.
+                if NOTIFY_ENABLED and not (recovered or auto_applied):
+                    n = subprocess.run([NOTIFY_CLI, inc_id], capture_output=True, text=True)
+                    if n.returncode != 0:
+                        print(f"WARN: notify failed for {inc_id}: {n.stderr}", file=sys.stderr)
+
+            per_job[job_id] = {
+                "last_seen_ts": ts,
+                "last_emitted_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "last_incident_id": p.stdout.strip(),
+            }
+
+        # Even if no new failures, update last_seen_ts to the newest run we observed
+        # so we don't re-scan history each tick.
+        newest_ts = max((r.get("ts") or r.get("runAtMs") or 0 for r in runs_entries), default=0)
+        if newest_ts and newest_ts > (per_job.get(job_id, {}).get("last_seen_ts") or 0):
+            per_job.setdefault(job_id, {})["last_seen_ts"] = newest_ts
+
+    # Emit coalesced gateway-restart cluster incidents (one per 60-sec bucket
+    # with ≥2 affected crons). Each cluster carries all member info; per-cron
+    # emits for these runs were skipped above.
+    cluster_emitted = 0
+    for bucket_ms, members in gateway_clusters:
+        members_sorted = sorted(members, key=lambda jm: (jm[1].get("ts") or jm[1].get("runAtMs") or 0))
+        first_job, first_run = members_sorted[0]
+        bucket_iso = iso(bucket_ms)
+        affected_agents = sorted({(jm[0].get("agentId") or "?") for jm in members_sorted})
+        # Try to resume each member; record per-member outcome.
+        resume_results: list[dict] = []
+        for jm in members_sorted:
+            cron_id = jm[0]["id"]
+            run_ts = jm[1].get("ts") or jm[1].get("runAtMs") or 0
+            res = try_resume(cron_id, run_ts, reason="gateway-restart-cluster")
+            res_with_ctx = {"cron_id": cron_id, "cron_name": jm[0].get("name"), **res}
+            resume_results.append(res_with_ctx)
+            if res.get("resumed"):
+                resumed_total += 1
+        affected_crons = [
+            {
+                "cron_id": jm[0]["id"],
+                "cron_name": jm[0].get("name"),
+                "agent_id": jm[0].get("agentId"),
+                "run_at": iso(jm[1].get("ts") or jm[1].get("runAtMs") or 0),
+                "duration_ms": jm[1].get("durationMs"),
+                "error_excerpt": (jm[1].get("error") or "")[:200],
+            }
+            for jm in members_sorted
+        ]
+        dedup_key = f"gateway-restart-cluster-{bucket_ms}"
+        title = f"Gateway restart cluster: {len(members_sorted)} crons interrupted @ {bucket_iso[:19]}"
+        resumed_count = sum(1 for r in resume_results if r.get("resumed"))
+        fields = {
+            "cluster_size": len(members_sorted),
+            "bucket_start": bucket_iso,
+            "window_ms": 60_000,
+            "affected_agents": affected_agents,
+            "affected_crons": affected_crons,
+            "resume_attempted": True,
+            "resumed_count": resumed_count,
+            "resume_results": resume_results,
+        }
+        related = {
+            "cluster_member_cron_ids": [jm[0]["id"] for jm in members_sorted],
+        }
+        body_lines = [
+            f"# Gateway restart cluster: {len(members_sorted)} crons interrupted",
+            f"bucket_start: {bucket_iso}",
+            f"window: 60 seconds",
+            f"affected_agents: {', '.join(affected_agents)}",
+            f"resumed: {resumed_count} / {len(members_sorted)}",
+            "",
+            "## Affected crons",
+        ]
+        for ac, rr in zip(affected_crons, resume_results):
+            status = "🔄 resumed" if rr.get("resumed") else f"⏭ skip ({rr.get('message', 'unknown')[:40]})"
+            body_lines.append(f"- {ac['cron_name']} ({ac['agent_id']}) @ {ac['run_at'][:19]} — {status}")
+        body_lines += [
+            "",
+            "## Likely root cause",
+            "Single gateway restart killed multiple in-flight cron runners simultaneously.",
+            "Look for gateway deploy/crash logs within ±60s of bucket_start.",
+            "",
+            "## Resume policy",
+            "Crons matching the idempotent allowlist in `bin/cron-resume` are auto-resumed via `openclaw cron run`. Others are notify-only.",
+        ]
+        emit_cmd = [
+            INCIDENT_CLI, "emit",
+            "--source", "cron",
+            "--severity", "high",
+            "--title", title,
+            "--agent", (affected_agents[0] if affected_agents else "unknown"),
+            "--key", dedup_key,
+            "--fields-json", json.dumps(fields),
+            "--related-json", json.dumps(related),
+        ]
+        p = subprocess.run(emit_cmd, input="\n".join(body_lines), capture_output=True, text=True)
+        if p.returncode != 0:
+            print(f"WARN: cluster emit failed for {bucket_ms}: {p.stderr}", file=sys.stderr)
+            continue
+        was_dedup = "DEDUP:" in (p.stderr or "")
+        if not was_dedup:
+            cluster_emitted += 1
+            inc_id = p.stdout.strip()
+            # Backfill per-cron state with the cluster incident id.
+            for jm in members_sorted:
+                ts = jm[1].get("ts") or jm[1].get("runAtMs") or 0
+                per_job[jm[0]["id"]] = {
+                    "last_seen_ts": ts,
+                    "last_emitted_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "last_incident_id": inc_id,
+                }
+
+    state["sources"]["cron"]["last_checked_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    save_state(state)
+
+    print(f"cron-postmortem-watch: emitted={emitted} cluster_emitted={cluster_emitted} resumed={resumed_total} skipped={skipped} scanned_runs={scanned_runs} jobs={len(jobs)}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

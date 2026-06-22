@@ -1,0 +1,571 @@
+#!/usr/bin/env python3
+"""Freshness auto-triage (round 1.5).
+
+Two-stage gating for `open` freshness-stale-file incidents:
+
+  Stage A — cheap gates (path allowlist + zero-backlink + early-exits):
+    - Only type `freshness-stale-file` (broken-ref incidents skip — too risky)
+    - File path matches AUTO_TRIAGE_ALLOWLIST (low-risk, regenerable paths)
+    - File path is NOT referenced anywhere else in any workspace markdown
+      (zero-backlink — proves nothing depends on this file)
+    - If file is already gone, mark applied (no-op) and done
+
+  Stage B — LLM content judge:
+    - Read first 2K chars of the file body
+    - Prompt the planner model: "is this content unique/durable, or
+      replaceable/exhaust?"
+    - Returns {verdict: "exhaust"|"durable", confidence: 0..1, reason: str}
+    - Auto-apply only if verdict=exhaust AND confidence >= threshold (0.90)
+
+  Apply:
+    - Move file → ${OPENCLAW_HOME}/cold-storage/<workspace>/<rel-path>
+    - Update incident frontmatter: status=applied, decided_by=auto-triage,
+      decided_at, triage_verdict block, and a Decision body section
+
+Usage:
+  freshness-auto-triage                  # dry-run (default — no writes)
+  freshness-auto-triage --commit         # actually apply
+  freshness-auto-triage --max N          # cap applications per run (default 10)
+  freshness-auto-triage --threshold X    # confidence threshold (default 0.90)
+  freshness-auto-triage --verbose        # show per-incident decisions
+
+Idempotent: only operates on status=open freshness incidents; skips others.
+Fail-open never auto-applies — any error in stage A or B → skip (escalate to
+the normal analyze→notify path).
+"""
+# SPDX-License-Identifier: MIT
+# Part of agent-harness (https://github.com/${GH_ORG}/agent-harness)
+from __future__ import annotations
+
+import argparse
+import fnmatch
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+HOME = Path(os.environ.get("HOME", os.path.expanduser("~")))
+OPENCLAW_HOME = Path(os.environ.get("OPENCLAW_HOME", os.path.expanduser("~/.openclaw")))
+OPENCLAW = OPENCLAW_HOME
+INCIDENTS_ROOT = Path(os.environ.get("OPENCLAW_INCIDENTS_DIR", str(OPENCLAW / "incidents")))
+COLD_STORAGE = OPENCLAW / "cold-storage"
+OPENCLAW_BIN = os.environ.get("OPENCLAW_BIN", "openclaw")
+
+JUDGE_MODEL = os.environ.get("FRESHNESS_JUDGE_MODEL", "ollama/glm-5.1:cloud")
+JUDGE_TIMEOUT_S = int(os.environ.get("FRESHNESS_JUDGE_TIMEOUT", "60"))
+DEFAULT_THRESHOLD = float(os.environ.get("FRESHNESS_AUTO_TRIAGE_THRESHOLD", "0.90"))
+BODY_HEAD_CHARS = int(os.environ.get("FRESHNESS_BODY_HEAD_CHARS", "2000"))
+
+
+def _load_agents_map():
+    """Return list of (agent_id, workspace_dir, persona) from config/agents.map."""
+    here = Path(__file__).resolve()
+    candidates = []
+    env_map = os.environ.get("AGENTS_MAP")
+    if env_map:
+        candidates.append(Path(env_map))
+    candidates.append(OPENCLAW_HOME / "config" / "agents.map")
+    candidates.append(here.parent.parent.parent / "config" / "agents.map")
+    for c in candidates:
+        try:
+            if c.is_file():
+                rows = []
+                for line in c.read_text(encoding="utf-8").splitlines():
+                    line = line.split("#", 1)[0].strip()
+                    if not line:
+                        continue
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        rows.append((parts[0], parts[1], parts[2]))
+                if rows:
+                    return rows
+        except OSError:
+            continue
+    return [("main", "workspace", "Orchestrator"), ("dev", "workspace-dev", "Developer")]
+
+
+AGENTS = _load_agents_map()
+# Workspace roots across all configured agents.
+WORKSPACES = [OPENCLAW / ws for _aid, ws, _persona in AGENTS]
+
+# Paths eligible for auto-archive. Conservative on purpose — these are paths
+# that are explicitly low-stakes/regenerable per freshness-policy.json:
+#   - dreaming/light + rem (auto-generated narrative)
+#   - scout outputs (intermediate research)
+#   - logs and sessions (operational ephemera)
+#   - inbox/handoffs/drafts (read-once / draining)
+# Everything else (memory/*, learning/**, wiki/**, decisions/**, retros) needs
+# a human eye.
+AUTO_TRIAGE_ALLOWLIST = [
+    "**/memory/dreaming/light/*.md",
+    "**/memory/dreaming/rem/*.md",
+    "**/memory/.dreams/**/*.md",
+    "**/scout-*.md",
+    "**/scout-*.txt",
+    "**/sessions/**/*.md",
+    "**/logs/**/*.md",
+    "**/inbox/*",
+    "**/handoffs/*",
+    "**/drafts/**/*.md",
+]
+
+FRONTMATTER_RE = re.compile(r"^---\n(.*?)\n---\n(.*)$", re.DOTALL)
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# ---------- frontmatter I/O (mirrors incident-analyze for round-trip safety) ----------
+
+def _scalar(v: str):
+    if v in ("null", "~"):
+        return None
+    if v == "true":
+        return True
+    if v == "false":
+        return False
+    if v.startswith('"') and v.endswith('"'):
+        try:
+            return json.loads(v)
+        except json.JSONDecodeError:
+            return v[1:-1]
+    if v.startswith("{") or v.startswith("["):
+        try:
+            return json.loads(v)
+        except json.JSONDecodeError:
+            return v
+    try:
+        return int(v)
+    except ValueError:
+        pass
+    try:
+        return float(v)
+    except ValueError:
+        pass
+    return v
+
+
+def parse_frontmatter(text: str) -> tuple[dict, str]:
+    m = FRONTMATTER_RE.match(text)
+    if not m:
+        raise ValueError("missing frontmatter")
+    fm_text, body = m.group(1), m.group(2)
+    fm: dict = {}
+    for raw_line in fm_text.split("\n"):
+        if not raw_line.strip() or raw_line.startswith(" "):
+            continue
+        if ":" not in raw_line:
+            continue
+        k, _, v = raw_line.partition(":")
+        fm[k.strip()] = _scalar(v.strip())
+    return fm, body
+
+
+def dump_yaml(d: dict) -> str:
+    lines = []
+    for k, v in d.items():
+        if v is None:
+            lines.append(f"{k}: null")
+        elif isinstance(v, bool):
+            lines.append(f"{k}: {'true' if v else 'false'}")
+        elif isinstance(v, (int, float)):
+            lines.append(f"{k}: {v}")
+        elif isinstance(v, str):
+            if v == "" or any(c in v for c in ":#\n\"'") or v.strip() != v:
+                lines.append(f"{k}: {json.dumps(v)}")
+            else:
+                lines.append(f"{k}: {v}")
+        elif isinstance(v, (dict, list)):
+            lines.append(f"{k}: {json.dumps(v, ensure_ascii=False)}")
+        else:
+            lines.append(f"{k}: {json.dumps(str(v))}")
+    return "\n".join(lines)
+
+
+def iter_incidents() -> list[Path]:
+    out = []
+    if not INCIDENTS_ROOT.exists():
+        return out
+    for day in sorted(INCIDENTS_ROOT.iterdir()):
+        if not day.is_dir() or not re.match(r"\d{4}-\d{2}-\d{2}", day.name):
+            continue
+        out.extend(sorted(day.glob("*.md")))
+    return out
+
+
+# ---------- classify incident ----------
+
+def classify_freshness_incident(fm: dict) -> str:
+    """Return 'stale-file', 'broken-ref', or 'other' from the title/fields."""
+    title = (fm.get("title") or "").lower()
+    if "stale file" in title or "expired" in title:
+        return "stale-file"
+    if "broken skill reference" in title or "broken slug reference" in title:
+        return "broken-ref"
+    return "other"
+
+
+# ---------- stage A: allowlist + zero-backlink ----------
+
+def matches_allowlist(path: str) -> bool:
+    for glob in AUTO_TRIAGE_ALLOWLIST:
+        if fnmatch.fnmatch(path, glob):
+            return True
+    return False
+
+
+def workspace_rel(p: Path) -> tuple[str, Path] | None:
+    """Return (workspace_name, rel_path) or None if not under a workspace."""
+    for ws in WORKSPACES:
+        try:
+            rel = p.relative_to(ws)
+            return ws.name, rel
+        except ValueError:
+            continue
+    return None
+
+
+def zero_backlink(target: Path) -> tuple[bool, list[str]]:
+    """True if no other workspace markdown references the target.
+
+    Looks for the filename and the workspace-relative path inside other .md
+    files (excludes the target itself and cold-storage). Returns
+    (passes, references_found).
+    """
+    if not target.exists():
+        return True, []  # already gone — vacuously safe
+    fname = target.name
+    refs: list[str] = []
+    # Search just the basename and a 2-segment tail as the lookup token. Bare
+    # basename is too permissive (e.g. dates appear in many files), so we
+    # require either a slash or surrounding punctuation that suggests "this
+    # is a path reference."
+    tail_segments = list(target.parts[-3:])  # e.g. ["dreaming", "light", "2026-04-22.md"]
+    tail_path = "/".join(tail_segments)
+
+    for ws in WORKSPACES:
+        if not ws.exists():
+            continue
+        for f in ws.rglob("*.md"):
+            if f.resolve() == target.resolve():
+                continue
+            if "cold-storage" in f.parts or "archive" in f.parts:
+                continue
+            # Skip cross-references from other auto-archivable files (e.g. dream
+            # diary files cite each other — those are exhaust-citing-exhaust and
+            # shouldn't block archival of any one of them).
+            if matches_allowlist(str(f)):
+                continue
+            try:
+                text = f.read_text(errors="replace")
+            except Exception:
+                continue
+            # Cheap pre-filter on basename; only do deeper match if hit.
+            if fname not in text:
+                continue
+            # Require the basename to appear with path-context (slash before, or in backticks/parens)
+            # rather than coincidental date-string match in prose.
+            if tail_path in text:
+                refs.append(f"{f}::tail-path")
+                continue
+            # Otherwise: only flag if basename appears in a markdown link, backtick, or after a slash
+            ref_patterns = [
+                rf"/{re.escape(fname)}\b",
+                rf"`[^`]*{re.escape(fname)}[^`]*`",
+                rf"\([^)]*{re.escape(fname)}[^)]*\)",
+            ]
+            for pat in ref_patterns:
+                if re.search(pat, text):
+                    refs.append(f"{f}::regex:{pat[:40]}")
+                    break
+    return (len(refs) == 0), refs
+
+
+# ---------- stage B: LLM content judge ----------
+
+JUDGE_PROMPT_TEMPLATE = """You are the JUDGE for freshness auto-triage. A file has been flagged as stale (past its policy lifespan). I'm about to archive it to cold-storage. Your job: read the head of its content and decide whether the content is "exhaust" (replaceable / low-stakes / auto-generated narrative that can safely be archived) or "durable" (carries unique signal that a human should review before archiving).
+
+Decline (durable) if:
+- The file contains a non-obvious decision, learning, or fact a human captured by hand
+- The file references a one-time event with specifics no other source captures
+- The file shows signs of being a deliberate compound-learning page (durable knowledge)
+
+Approve (exhaust) if:
+- Auto-generated narrative or dream-diary prose (poetic, summarizing what already happened elsewhere)
+- Scout/research intermediate output that has clearly been used and superseded
+- Read-once material from inbox/handoffs/sessions/logs
+- Content that's a duplicate of a more canonical doc
+
+INCIDENT METADATA:
+{incident_meta}
+
+FILE PATH: {file_path}
+FILE HEAD (first {n_chars} chars):
+---
+{body_head}
+---
+
+Return a single JSON object — no fences, no preamble:
+{{
+  "verdict": "exhaust" or "durable",
+  "confidence": 0.0 to 1.0,
+  "reason": "<one short sentence>"
+}}
+"""
+
+
+def call_judge(file_path: Path, incident_meta: dict, body_head: str) -> dict:
+    """Returns {verdict, confidence, reason} or raises."""
+    prompt = JUDGE_PROMPT_TEMPLATE.format(
+        incident_meta=json.dumps(incident_meta, indent=2),
+        file_path=str(file_path),
+        n_chars=BODY_HEAD_CHARS,
+        body_head=body_head,
+    )
+    cmd = [OPENCLAW_BIN, "infer", "model", "run", "--model", JUDGE_MODEL,
+           "--thinking", "off", "--prompt", prompt, "--json"]
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=JUDGE_TIMEOUT_S)
+    if p.returncode != 0:
+        raise RuntimeError(f"judge call failed: {(p.stderr or p.stdout).strip()[:300]}")
+    envelope = json.loads(p.stdout)
+    text = (envelope.get("outputs") or [{}])[0].get("text", "")
+    text = re.sub(r"^```(?:json)?\s*", "", text.strip())
+    text = re.sub(r"\s*```$", "", text.strip())
+    m = re.search(r"\{.*\}", text, re.DOTALL)
+    if not m:
+        raise RuntimeError(f"judge returned non-JSON: {text[:300]}")
+    verdict = json.loads(m.group(0))
+    v = str(verdict.get("verdict", "")).lower().strip()
+    if v not in ("exhaust", "durable"):
+        raise RuntimeError(f"judge returned bad verdict: {v!r}")
+    return {
+        "verdict": v,
+        "confidence": max(0.0, min(1.0, float(verdict.get("confidence", 0)))),
+        "reason": str(verdict.get("reason", "")).strip()[:300],
+    }
+
+
+# ---------- apply: move to cold-storage ----------
+
+def archive_file(target: Path) -> Path:
+    """Move target → ${OPENCLAW_HOME}/cold-storage/<workspace>/<rel-path>. Returns dest."""
+    rel_info = workspace_rel(target)
+    if rel_info is None:
+        # Fallback: dump under cold-storage/orphan/ keyed by absolute path tail
+        dest = COLD_STORAGE / "orphan" / target.name
+    else:
+        ws_name, rel = rel_info
+        dest = COLD_STORAGE / ws_name / rel
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists():
+        # Suffix with timestamp to avoid collision
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        dest = dest.with_name(f"{dest.stem}.{ts}{dest.suffix}")
+    shutil.move(str(target), str(dest))
+    return dest
+
+
+# ---------- main per-incident triage ----------
+
+def triage_one(inc_path: Path, commit: bool, threshold: float, verbose: bool) -> dict:
+    """Returns a result dict with shape:
+      {decision: "applied" | "skipped" | "declined" | "noop", reason: str, ...}
+    """
+    try:
+        raw = inc_path.read_text()
+        fm, body = parse_frontmatter(raw)
+    except Exception as e:
+        return {"decision": "skipped", "reason": f"parse-error: {e}"}
+
+    if fm.get("source") != "freshness":
+        return {"decision": "skipped", "reason": "not-freshness"}
+    if fm.get("status") != "open":
+        return {"decision": "skipped", "reason": f"status={fm.get('status')}"}
+
+    incident_class = classify_freshness_incident(fm)
+    if incident_class != "stale-file":
+        return {"decision": "skipped", "reason": f"class={incident_class} (only stale-file auto-triaged)"}
+
+    fields = fm.get("fields") if isinstance(fm.get("fields"), dict) else {}
+    file_path = fields.get("file_path")
+    if not file_path:
+        return {"decision": "skipped", "reason": "no file_path in fields"}
+    target = Path(file_path)
+
+    # Stage A.1 — file gone? mark applied as no-op.
+    if not target.exists():
+        if commit:
+            fm["status"] = "applied"
+            fm["decided_choice"] = "noop-already-gone"
+            fm["decided_by"] = "auto-triage"
+            fm["decided_at"] = now_iso()
+            fm["applied_at"] = fm["decided_at"]
+            fm["applied_by"] = "auto-triage"
+            fm["triage_verdict"] = {"verdict": "noop", "confidence": 1.0, "reason": "file already absent"}
+            decision_block = (
+                "\n## Decision\n\n```json\n"
+                + json.dumps({"choice": "noop-already-gone", "decided_by": "auto-triage",
+                              "decided_at": fm["decided_at"]}, indent=2)
+                + "\n```\n"
+            )
+            if "## Decision" in body:
+                body = re.sub(r"## Decision\n.*?(?=\n## |\Z)", lambda _m: decision_block.lstrip("\n").rstrip("\n"), body, count=1, flags=re.DOTALL)
+            else:
+                body = body.rstrip() + decision_block
+            inc_path.write_text(f"---\n{dump_yaml(fm)}\n---\n{body}")
+        return {"decision": "applied", "reason": "file-already-gone", "target": file_path}
+
+    # Stage A.2 — allowlist
+    if not matches_allowlist(file_path):
+        return {"decision": "skipped", "reason": "not-in-allowlist", "target": file_path}
+
+    # Stage A.3 — zero-backlink
+    try:
+        ok, refs = zero_backlink(target)
+    except Exception as e:
+        return {"decision": "skipped", "reason": f"backlink-error: {e}", "target": file_path}
+    if not ok:
+        return {"decision": "skipped", "reason": f"backlinked-by={len(refs)}",
+                "target": file_path, "sample_backlinks": refs[:3]}
+
+    # Stage B — LLM content judge
+    try:
+        body_text = target.read_text(errors="replace")[:BODY_HEAD_CHARS]
+    except Exception as e:
+        return {"decision": "skipped", "reason": f"read-error: {e}", "target": file_path}
+
+    incident_meta = {
+        "title": fm.get("title"),
+        "lifespan": fields.get("lifespan"),
+        "policy_source": fields.get("policy_source"),
+        "why": fields.get("why"),
+        "agent": fm.get("agent"),
+    }
+    try:
+        verdict = call_judge(target, incident_meta, body_text)
+    except Exception as e:
+        return {"decision": "skipped", "reason": f"judge-error: {str(e)[:200]}",
+                "target": file_path}
+
+    if verdict["verdict"] != "exhaust" or verdict["confidence"] < threshold:
+        return {
+            "decision": "declined",
+            "reason": f"judge: verdict={verdict['verdict']} conf={verdict['confidence']:.2f} (need exhaust + >={threshold})",
+            "target": file_path,
+            "verdict": verdict,
+        }
+
+    # Both gates pass — apply.
+    if not commit:
+        return {
+            "decision": "would-apply",
+            "reason": "both gates pass (dry-run)",
+            "target": file_path,
+            "verdict": verdict,
+        }
+
+    try:
+        dest = archive_file(target)
+    except Exception as e:
+        return {"decision": "skipped", "reason": f"archive-error: {e}", "target": file_path}
+
+    fm["status"] = "applied"
+    fm["decided_choice"] = "archive-to-cold-storage"
+    fm["decided_by"] = "auto-triage"
+    fm["decided_at"] = now_iso()
+    fm["applied_at"] = fm["decided_at"]
+    fm["applied_by"] = "auto-triage"
+    fm["confidence"] = verdict["confidence"]
+    fm["triage_verdict"] = verdict
+
+    decision_block = (
+        "\n## Decision\n\n```json\n"
+        + json.dumps({
+            "choice": "archive-to-cold-storage",
+            "decided_by": "auto-triage",
+            "decided_at": fm["decided_at"],
+            "from": file_path,
+            "to": str(dest),
+            "triage_verdict": verdict,
+        }, indent=2)
+        + "\n```\n"
+    )
+    if "## Decision" in body:
+        body = re.sub(r"## Decision\n.*?(?=\n## |\Z)", lambda _m: decision_block.lstrip("\n").rstrip("\n"), body, count=1, flags=re.DOTALL)
+    else:
+        body = body.rstrip() + decision_block
+    inc_path.write_text(f"---\n{dump_yaml(fm)}\n---\n{body}")
+
+    return {
+        "decision": "applied",
+        "reason": "both gates pass",
+        "target": file_path,
+        "dest": str(dest),
+        "verdict": verdict,
+    }
+
+
+# ---------- CLI ----------
+
+def main() -> int:
+    p = argparse.ArgumentParser(prog="freshness-auto-triage")
+    p.add_argument("--commit", action="store_true", help="actually apply (default dry-run)")
+    p.add_argument("--max", type=int, default=10, help="cap applications per run")
+    p.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD,
+                   help=f"judge confidence threshold (default {DEFAULT_THRESHOLD})")
+    p.add_argument("--verbose", "-v", action="store_true")
+    p.add_argument("--id", help="only triage this incident id (debug)")
+    args = p.parse_args()
+
+    candidates = []
+    for f in iter_incidents():
+        try:
+            fm, _ = parse_frontmatter(f.read_text())
+        except Exception:
+            continue
+        if fm.get("source") != "freshness" or fm.get("status") != "open":
+            continue
+        if args.id and not (fm.get("id") or "").endswith(args.id):
+            continue
+        candidates.append(f)
+
+    mode = "COMMIT" if args.commit else "DRY-RUN"
+    print(f"=== freshness-auto-triage ({mode}) ===")
+    print(f"open freshness incidents: {len(candidates)} | threshold: {args.threshold} | cap: {args.max}")
+    print()
+
+    counts = {"applied": 0, "would-apply": 0, "skipped": 0, "declined": 0}
+    applied_this_run = 0
+    for inc in candidates:
+        result = triage_one(inc, commit=args.commit, threshold=args.threshold, verbose=args.verbose)
+        d = result["decision"]
+        counts[d] = counts.get(d, 0) + 1
+        if d in ("applied", "would-apply"):
+            applied_this_run += 1
+        tag = {"applied": "APPLIED", "would-apply": "WOULD", "skipped": "skip", "declined": "DECLINE"}.get(d, d)
+        if args.verbose or d in ("applied", "would-apply", "declined"):
+            short_id = inc.parent.name + "/" + inc.name
+            print(f"  [{tag:7s}] {short_id}")
+            print(f"           target: {result.get('target', '?')}")
+            print(f"           reason: {result.get('reason', '')}")
+            if "verdict" in result:
+                v = result["verdict"]
+                print(f"           judge:  verdict={v.get('verdict')} conf={v.get('confidence', 0):.2f}  reason={v.get('reason', '')[:120]}")
+        if applied_this_run >= args.max and args.commit:
+            print(f"  (cap reached: {args.max})")
+            break
+
+    print()
+    print(f"applied={counts['applied']} would-apply={counts.get('would-apply', 0)} declined={counts['declined']} skipped={counts['skipped']}")
+    if not args.commit:
+        print("(dry-run — no incidents modified, no files moved. Run with --commit to apply.)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

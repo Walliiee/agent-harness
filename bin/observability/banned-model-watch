@@ -1,0 +1,160 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Part of agent-harness (https://github.com/${GH_ORG}/agent-harness)
+"""Banned-model cron watcher.
+
+Scans `openclaw cron list` for production crons using models that have been
+banned for cron use due to evidence-backed failure patterns. Emits a drift
+incident per offending cron so the system catches regressions (manual edits,
+imported cron configs, etc.).
+
+Banned models live in BANNED_MODELS below — keep this list in sync with the
+HARD COST POLICY block in `bin/incident-analyze`.
+
+Best-effort posting — failure logs a WARN but does not raise.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+OPENCLAW_HOME = Path(os.environ.get("OPENCLAW_HOME", os.path.expanduser("~/.openclaw")))
+HOME = Path(os.environ.get("HOME", os.path.expanduser("~")))
+INCIDENTS_ROOT = OPENCLAW_HOME / "incidents"
+WATCHER_LOG = INCIDENTS_ROOT / "banned-model-watch.log"
+OPENCLAW = os.environ.get("OPENCLAW_BIN", "openclaw")
+
+# Keep in sync with HARD COST POLICY in bin/incident-analyze.
+BANNED_MODELS = {
+    "ollama/kimi-k2.6:cloud": "3/3 file-edit failures + 3 tool-usage-drift; swept 2026-06-01",
+}
+
+
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def log(msg: str) -> None:
+    WATCHER_LOG.parent.mkdir(parents=True, exist_ok=True)
+    ts = now_utc().strftime("%Y-%m-%dT%H:%M:%SZ")
+    with WATCHER_LOG.open("a") as fh:
+        fh.write(f"{ts} {msg}\n")
+
+
+def list_crons() -> list[dict]:
+    p = subprocess.run([OPENCLAW, "cron", "list", "--json"], capture_output=True, text=True, timeout=60)
+    if p.returncode != 0:
+        log(f"WARN cron list failed: {p.stderr.strip()[:200]}")
+        return []
+    try:
+        return json.loads(p.stdout).get("jobs", []) or []
+    except json.JSONDecodeError as e:
+        log(f"WARN cron list JSON parse: {e}")
+        return []
+
+
+def find_offenders(jobs: list[dict]) -> list[dict]:
+    hits = []
+    for j in jobs:
+        payload = j.get("payload") or {}
+        if not isinstance(payload, dict):
+            continue
+        m = payload.get("model")
+        if m in BANNED_MODELS:
+            hits.append({
+                "id": j.get("id"),
+                "name": j.get("name") or "",
+                "agent": j.get("agentId") or "?",
+                "model": m,
+            })
+    return hits
+
+
+def emit_incident(hit: dict) -> Path | None:
+    """Write a drift incident file for one banned-model cron."""
+    day = now_utc().strftime("%Y-%m-%d")
+    day_dir = INCIDENTS_ROOT / day
+    day_dir.mkdir(parents=True, exist_ok=True)
+    dedup_key = f"banned-model-{hit['id']}"
+    iid = hashlib.sha1(dedup_key.encode()).hexdigest()[:12]
+    # Dedup: skip if any open/proposed incident with this dedup_key already exists today.
+    for f in day_dir.glob("banned-model-*.md"):
+        try:
+            text = f.read_text()
+        except Exception:
+            continue
+        if f"dedup_key: {dedup_key}" in text:
+            return None  # already emitted today
+    safe_name = (hit["name"] or "unknown").replace("/", "-").replace(" ", "-")[:40]
+    path = day_dir / f"banned-model-{safe_name}-{iid}.md"
+    reason = BANNED_MODELS[hit["model"]]
+    fm_lines = [
+        "---",
+        f"id: banned-model-{iid}",
+        f"dedup_key: {dedup_key}",
+        "source: banned-model-watch",
+        "type: tool-usage-drift",
+        f'detected_at: "{now_utc().strftime("%Y-%m-%dT%H:%M:%SZ")}"',
+        "status: open",
+        "severity: medium",
+        f'title: "Cron {hit["id"][:8]} ({hit["agent"]}) using banned model {hit["model"]}"',
+        f"agent: {hit['agent']}",
+        f'fields: {json.dumps({"cron_id": hit["id"], "model": hit["model"], "ban_reason": reason})}',
+        "---",
+    ]
+    body = f"""# Banned-model cron detected: {hit['name']}
+
+## Context
+
+- **Cron id:** `{hit['id']}`
+- **Agent:** `{hit['agent']}`
+- **Current model:** `{hit['model']}`
+- **Ban reason:** {reason}
+
+## Why this fires
+
+Two Ollama-cloud models are banned for cron use per HARD COST POLICY in `bin/incident-analyze`:
+
+- `ollama/glm-5.1:cloud`   — garbled tool calls (5 incidents)
+- `ollama/kimi-k2.6:cloud` — file-edit failures + tool-usage drift (3+3 incidents)
+
+The 2026-06-01 sweep moved all production crons off these models to `ollama/deepseek-v4-pro:cloud`. This cron has drifted back to a banned model — likely a manual edit or imported config.
+
+## Suggested fix
+
+```
+openclaw cron edit --model ollama/deepseek-v4-pro:cloud {hit['id']}
+```
+"""
+    path.write_text("\n".join(fm_lines) + "\n\n" + body)
+    return path
+
+
+def main() -> int:
+    jobs = list_crons()
+    if not jobs:
+        log("no jobs returned; skipping check")
+        return 0
+    offenders = find_offenders(jobs)
+    if not offenders:
+        log(f"ok — {len(jobs)} crons scanned, 0 banned-model offenders")
+        return 0
+    written = 0
+    for hit in offenders:
+        path = emit_incident(hit)
+        if path:
+            written += 1
+            log(f"emitted {path.name} for cron {hit['id'][:8]} model={hit['model']}")
+        else:
+            log(f"dedup-skip cron {hit['id'][:8]} already has open banned-model incident today")
+    log(f"summary: {len(offenders)} offenders, {written} new incidents written")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

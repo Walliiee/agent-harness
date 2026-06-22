@@ -1,0 +1,232 @@
+#!/usr/bin/env python3
+"""Drift apply pipeline liveness watcher.
+
+Fires every 4h during the analyzer's active window. Two stall signals:
+
+  A. analyzer.log mtime > STALL_HOURS_LOG_AGE old while inside the active window
+     (analyzer schedule is 09:30 / 11:30 / 13:30 / 15:30 / 17:30 / 19:30 / 21:30 / 23:30,
+     i.e., a 2h cadence). 5h slack covers a missed firing + run time.
+
+  B. There are open incidents waiting AND the newest analyzed_at timestamp in the
+     ledger is > STALL_HOURS_NO_PROGRESS old. Distinguishes "analyzer firing but
+     stuck in skip-loop" from "analyzer firing on empty queue" (the latter is fine).
+
+If either fires, post a one-line ⚠️ alert to the Drift Telegram topic. Anti-spam
+state in ~/.openclaw/incidents/liveness-state.json suppresses repeated alerts
+within ANTI_SPAM_HOURS of the previous alert (one alert per stall episode).
+
+Always logs to ~/.openclaw/incidents/drift-liveness.log. Best-effort posting — a
+Drift post failure prints a WARN but does not raise.
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+
+# ---------- config ----------
+HOME = Path(os.environ.get("HOME", os.path.expanduser("~")))
+OPENCLAW_HOME = Path(os.environ.get("OPENCLAW_HOME", str(HOME / ".openclaw")))
+INCIDENTS_ROOT = OPENCLAW_HOME / "incidents"
+ANALYZER_LOG = INCIDENTS_ROOT / "analyzer.log"
+STATE_FILE = INCIDENTS_ROOT / "liveness-state.json"
+WATCHER_LOG = INCIDENTS_ROOT / "drift-liveness.log"
+
+# Thresholds (env-overridable).
+STALL_HOURS_LOG_AGE = float(os.environ.get("LIVENESS_LOG_AGE_HOURS", "5"))
+STALL_HOURS_NO_PROGRESS = float(os.environ.get("LIVENESS_NO_PROGRESS_HOURS", "24"))
+ANTI_SPAM_HOURS = float(os.environ.get("LIVENESS_ANTI_SPAM_HOURS", "8"))
+# Active window: analyzer fires 09:30-23:30. Watcher only complains during this window.
+ACTIVE_HOUR_START = int(os.environ.get("LIVENESS_ACTIVE_HOUR_START", "9"))
+ACTIVE_HOUR_END = int(os.environ.get("LIVENESS_ACTIVE_HOUR_END", "24"))
+# Scan budget for newest analyzed_at lookup — only look at the last N days of incidents.
+SCAN_DAYS = int(os.environ.get("LIVENESS_SCAN_DAYS", "14"))
+
+OPENCLAW = os.environ.get("OPENCLAW_BIN", "openclaw")
+# Telegram routing — read from env, EMPTY by default. When HARNESS_TG_CHAT_ID is
+# unset the alert post becomes a no-op (see post_drift()).
+#   HARNESS_TG_CHAT_ID        — target chat/group id for the ops group
+#   HARNESS_TG_DRIFT_TOPIC_ID — topic (thread) id for the Drift topic
+DRIFT_CHAT = os.environ.get("HARNESS_TG_CHAT_ID", "")
+DRIFT_THREAD = os.environ.get("HARNESS_TG_DRIFT_TOPIC_ID", "")
+DRIFT_ACCOUNT = os.environ.get("DRIFT_ACCOUNT", "main")
+NOTIFY_ENABLED = os.environ.get("LIVENESS_NOTIFY", "1") not in ("0", "false", "no")
+
+FRONTMATTER_RE = re.compile(r"^---\n(.*?)\n---\n", re.DOTALL)
+
+
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def log(msg: str) -> None:
+    WATCHER_LOG.parent.mkdir(parents=True, exist_ok=True)
+    ts = now_utc().strftime("%Y-%m-%dT%H:%M:%SZ")
+    with WATCHER_LOG.open("a") as fh:
+        fh.write(f"{ts} {msg}\n")
+
+
+def post_drift(text: str) -> bool:
+    if not NOTIFY_ENABLED:
+        log(f"NOTIFY-DISABLED would-post: {text}")
+        return True
+    if not DRIFT_CHAT:
+        log(f"NOTIFY-SKIP (HARNESS_TG_CHAT_ID unset) would-post: {text}")
+        return True
+    cmd = [
+        OPENCLAW, "message", "send",
+        "--channel", "telegram",
+        "--account", DRIFT_ACCOUNT,
+        "--target", DRIFT_CHAT,
+        "--thread-id", DRIFT_THREAD,
+        "--message", text,
+    ]
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if p.returncode != 0:
+            log(f"WARN drift post failed: {p.stderr.strip()[:200]}")
+            return False
+        return True
+    except Exception as e:
+        log(f"WARN drift post raised: {e}")
+        return False
+
+
+def in_active_window(now: datetime) -> bool:
+    # Convert UTC now to Europe/Copenhagen by reading TZ env or using local time.
+    # Plist runs in user session so local time is fine via .astimezone().
+    local = now.astimezone()
+    return ACTIVE_HOUR_START <= local.hour < ACTIVE_HOUR_END
+
+
+def analyzer_log_age_hours() -> float | None:
+    if not ANALYZER_LOG.exists():
+        return None
+    age_s = now_utc().timestamp() - ANALYZER_LOG.stat().st_mtime
+    return age_s / 3600.0
+
+
+def scan_incidents() -> tuple[int, datetime | None]:
+    """Return (n_open, newest_analyzed_at). Only scans the last SCAN_DAYS days."""
+    if not INCIDENTS_ROOT.exists():
+        return 0, None
+    cutoff = (now_utc() - timedelta(days=SCAN_DAYS)).date()
+    n_open = 0
+    newest_analyzed: datetime | None = None
+    for day in sorted(INCIDENTS_ROOT.iterdir(), reverse=True):
+        if not day.is_dir():
+            continue
+        m = re.match(r"(\d{4})-(\d{2})-(\d{2})", day.name)
+        if not m:
+            continue
+        try:
+            day_date = datetime(int(m[1]), int(m[2]), int(m[3]), tzinfo=timezone.utc).date()
+        except ValueError:
+            continue
+        if day_date < cutoff:
+            break
+        for f in day.glob("*.md"):
+            try:
+                text = f.read_text()
+            except Exception:
+                continue
+            fm_m = FRONTMATTER_RE.match(text)
+            if not fm_m:
+                continue
+            fm_text = fm_m.group(1)
+            status_m = re.search(r"^status:\s*(\S+)", fm_text, re.M)
+            if status_m and status_m.group(1) == "open":
+                n_open += 1
+            ana_m = re.search(r"^analyzed_at:\s*\"?([^\"\n]+)\"?", fm_text, re.M)
+            if ana_m:
+                try:
+                    ts = datetime.strptime(ana_m.group(1), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+                    if newest_analyzed is None or ts > newest_analyzed:
+                        newest_analyzed = ts
+                except ValueError:
+                    pass
+    return n_open, newest_analyzed
+
+
+def load_state() -> dict:
+    if not STATE_FILE.exists():
+        return {}
+    try:
+        return json.loads(STATE_FILE.read_text())
+    except Exception:
+        return {}
+
+
+def save_state(state: dict) -> None:
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    STATE_FILE.write_text(json.dumps(state, indent=2))
+
+
+def should_suppress(state: dict, now: datetime) -> bool:
+    last_alert = state.get("last_alert_at")
+    if not last_alert:
+        return False
+    try:
+        ts = datetime.strptime(last_alert, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return False
+    age_h = (now - ts).total_seconds() / 3600.0
+    return age_h < ANTI_SPAM_HOURS
+
+
+def main() -> int:
+    now = now_utc()
+    active = in_active_window(now)
+    log_age = analyzer_log_age_hours()
+    n_open, newest_analyzed = scan_incidents()
+    no_progress_hours: float | None = None
+    if newest_analyzed is not None:
+        no_progress_hours = (now - newest_analyzed).total_seconds() / 3600.0
+
+    log(
+        f"check active={active} log_age_h={log_age!r} open={n_open} "
+        f"newest_analyzed={newest_analyzed.strftime('%Y-%m-%dT%H:%M:%SZ') if newest_analyzed else None} "
+        f"no_progress_h={no_progress_hours!r}"
+    )
+
+    signals: list[str] = []
+    if active:
+        if log_age is None:
+            signals.append("analyzer.log missing")
+        elif log_age > STALL_HOURS_LOG_AGE:
+            signals.append(f"analyzer.log last touched {log_age:.1f}h ago (>{STALL_HOURS_LOG_AGE}h)")
+        # Signal B: progress stall — only meaningful when there's something to analyze.
+        if n_open > 0 and no_progress_hours is not None and no_progress_hours > STALL_HOURS_NO_PROGRESS:
+            signals.append(
+                f"{n_open} open incidents but newest analyzed_at is {no_progress_hours:.1f}h ago "
+                f"(>{STALL_HOURS_NO_PROGRESS}h)"
+            )
+
+    state = load_state()
+    if not signals:
+        log("ok")
+        # Refresh "last_ok_at" for visibility, but don't touch alert state.
+        state["last_ok_at"] = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+        save_state(state)
+        return 0
+
+    if should_suppress(state, now):
+        log(f"STALL signals=[{'; '.join(signals)}] — suppressed (within anti-spam window)")
+        return 0
+
+    alert_text = "⚠️ Drift pipeline liveness: " + " · ".join(signals)
+    ok = post_drift(alert_text)
+    state["last_alert_at"] = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    state["last_alert_signals"] = signals
+    state["last_alert_posted"] = ok
+    save_state(state)
+    log(f"ALERTED post_ok={ok} signals=[{'; '.join(signals)}]")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,113 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Part of agent-harness (https://github.com/${GH_ORG}/agent-harness)
+"""Sanitize ${OPENCLAW_HOME}/openclaw.json -> DR bundle config/openclaw.json.template.
+
+Replaces secret-shaped values with <REDACTED_*> markers so the live config
+(model chains, routing, agent identity wiring) can be pushed to GitHub
+without leaking API keys.
+
+Idempotent: re-running produces byte-identical output when source is unchanged.
+Silent on no-op (no template change). Prints one line when template was rewritten.
+
+Wired as a presync hook in the DR sync script (claw-sync-all.sh).
+
+Env:
+  OPENCLAW_HOME   root of the openclaw install (default ~/.openclaw)
+  DR_BUNDLE_DIR   destination DR repo (default ~/openclaw-dr-bundle)
+"""
+from __future__ import annotations
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+OPENCLAW_HOME = Path(os.environ.get("OPENCLAW_HOME", os.path.expanduser("~/.openclaw")))
+DR_BUNDLE_DIR = Path(os.environ.get("DR_BUNDLE_DIR", os.path.expanduser("~/openclaw-dr-bundle")))
+
+SRC = OPENCLAW_HOME / "openclaw.json"
+DST = DR_BUNDLE_DIR / "config" / "openclaw.json.template"
+
+# Substring (not end-anchored) so bare 'token', 'GBRAIN_TOKEN_MAIN', 'csrfToken'
+# all match. Short/safe values are still protected by is_safe_value().
+SECRET_KEY_PATTERNS = [
+    re.compile(r".*API_?KEY.*", re.I),      # API_KEY, APIKEY, X_API_KEY, apikey
+    re.compile(r".*TOKEN.*", re.I),         # token, GBRAIN_TOKEN_MAIN, ACCESS_TOKEN, csrfToken
+    re.compile(r".*SECRET.*", re.I),
+    re.compile(r".*PASSWORD.*", re.I),
+    re.compile(r".*PASSPHRASE.*", re.I),
+    re.compile(r".*CREDENTIAL.*", re.I),
+    re.compile(r".*PRIVATE_?KEY.*", re.I),
+    re.compile(r"^Authorization$"),
+]
+
+# Values that are safe to keep verbatim even under a secret-shaped key.
+SAFE_VALUE_PATTERNS = [
+    re.compile(r"\$\{[A-Z0-9_]+\}"),    # contains ${VAR} interpolation (binding only)
+    re.compile(r"^/"),                  # absolute path
+    re.compile(r"^~"),                  # home-relative path
+    re.compile(r"^https?://"),          # URL
+    re.compile(r"^(ollama-local|none|disabled|off|true|false)$", re.I),
+]
+
+EMAIL_RE = re.compile(r"([\w._%+-]+)@([\w.-]+\.\w+)")
+
+
+def is_safe_value(v: str) -> bool:
+    if len(v) < 12:
+        return True
+    return any(p.search(v) for p in SAFE_VALUE_PATTERNS)
+
+
+def redact_value(key: str, value: str) -> str:
+    marker = f"<REDACTED_{key.upper()}>"
+    return marker
+
+
+def redact_email_in_key(key: str) -> str:
+    return EMAIL_RE.sub(r"<REDACTED_EMAIL>", key)
+
+
+def walk(obj):
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            # Redact email-shaped keys (e.g., auth.profiles."x@privaterelay.apple")
+            new_key = redact_email_in_key(k) if EMAIL_RE.search(k) else k
+
+            if isinstance(v, str) and any(p.match(k) for p in SECRET_KEY_PATTERNS):
+                if not is_safe_value(v):
+                    out[new_key] = redact_value(k, v)
+                    continue
+            # Email-shaped string values
+            if isinstance(v, str) and EMAIL_RE.search(v) and "@privaterelay" in v:
+                out[new_key] = EMAIL_RE.sub("<REDACTED_EMAIL>", v)
+                continue
+            out[new_key] = walk(v)
+        return out
+    if isinstance(obj, list):
+        return [walk(x) for x in obj]
+    return obj
+
+
+def main() -> int:
+    if not SRC.exists():
+        print(f"sanitize: source missing: {SRC}", file=sys.stderr)
+        return 1
+    DST.parent.mkdir(parents=True, exist_ok=True)
+
+    data = json.loads(SRC.read_text())
+    sanitized = walk(data)
+    new_text = json.dumps(sanitized, indent=2, sort_keys=False) + "\n"
+
+    if DST.exists() and DST.read_text() == new_text:
+        return 0  # silent no-op
+
+    DST.write_text(new_text)
+    print(f"sanitize: rewrote {DST} ({len(new_text)} bytes)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

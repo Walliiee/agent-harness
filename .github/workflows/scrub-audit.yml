@@ -1,0 +1,44 @@
+name: scrub-audit
+
+# Leak gate: fail the build if any author identifier, absolute home path, or
+# secret-shaped value ships in a tracked file. Also runs shellcheck on the bin
+# scripts (allow-fail — advisory only).
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  scrub-audit:
+    name: scrub-audit (no leaks)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run scrub-audit
+        run: bash scripts/scrub-audit.sh
+
+  shellcheck:
+    name: shellcheck (advisory)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: Lint bin/**/*.sh
+        run: |
+          shopt -s globstar nullglob
+          files=(bin/**/*.sh)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No bin/**/*.sh files yet — nothing to lint."
+            exit 0
+          fi
+          shellcheck "${files[@]}"

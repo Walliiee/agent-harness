@@ -1,0 +1,85 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Part of agent-harness (https://github.com/${GH_ORG}/agent-harness)
+"""Append one structured interaction record to the harness interaction log.
+
+"Your harness, your memory" pattern: a queryable record of what each agent
+actually did — so the dreaming/consolidation loop, per-model performance
+tuning, and eval discipline have real data instead of vibes.
+
+Log: ${OPENCLAW_HOME}/state/interaction-log.jsonl  (one JSON object per line)
+Schema (all fields optional except agent + outcome):
+  ts            ISO-8601 UTC (auto if omitted)
+  agent         <agent-id from config/agents.map>
+  trigger       what initiated it: "cron:daily-intel", "dm", "delegation:dev", ...
+  model         provider/model that ran it (for per-model perf tuning)
+  outcome       success|fallback|error|skipped
+  tools         comma list -> array
+  memory_updated comma list of files/slugs touched -> array
+  note          one-line human summary
+  duration_ms   integer
+  run_id        skill-run / cron run id for cross-referencing
+
+Usage:
+  log-interaction --agent main --trigger cron:daily-intel --model ollama/glm-5.1:cloud \
+      --outcome success --tools tavily,browser --memory-updated intel/2026-06-13.md --note "7-stage pipeline ok"
+  echo '{"agent":"dev","outcome":"error","note":"ship-check failed"}' | log-interaction --json -
+"""
+import sys, os, json, argparse, fcntl
+from datetime import datetime, timezone
+
+OPENCLAW_HOME = os.environ.get("OPENCLAW_HOME", os.path.expanduser("~/.openclaw"))
+LOG = os.path.join(OPENCLAW_HOME, "state", "interaction-log.jsonl")
+ALLOWED_OUTCOME = {"success", "fallback", "error", "skipped"}
+
+
+def build_record(a):
+    if a.json:
+        raw = sys.stdin.read() if a.json == "-" else a.json
+        rec = json.loads(raw)
+    else:
+        rec = {}
+        for k in ("agent", "trigger", "model", "outcome", "note", "run_id"):
+            v = getattr(a, k.replace("-", "_"))
+            if v:
+                rec[k] = v
+        if a.tools:
+            rec["tools"] = [t.strip() for t in a.tools.split(",") if t.strip()]
+        if a.memory_updated:
+            rec["memory_updated"] = [m.strip() for m in a.memory_updated.split(",") if m.strip()]
+        if a.duration_ms is not None:
+            rec["duration_ms"] = a.duration_ms
+    rec.setdefault("ts", datetime.now(timezone.utc).isoformat(timespec="seconds"))
+    if not rec.get("agent"):
+        sys.exit("log-interaction: 'agent' is required")
+    if rec.get("outcome") and rec["outcome"] not in ALLOWED_OUTCOME:
+        sys.exit(f"log-interaction: outcome must be one of {sorted(ALLOWED_OUTCOME)}")
+    return rec
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--agent", help="agent-id from config/agents.map")
+    p.add_argument("--trigger")
+    p.add_argument("--model")
+    p.add_argument("--outcome")
+    p.add_argument("--tools")
+    p.add_argument("--memory-updated", dest="memory_updated")
+    p.add_argument("--note")
+    p.add_argument("--run-id", dest="run_id")
+    p.add_argument("--duration-ms", dest="duration_ms", type=int)
+    p.add_argument("--json", help="raw JSON object, or '-' for stdin")
+    a = p.parse_args()
+
+    rec = build_record(a)
+    os.makedirs(os.path.dirname(LOG), exist_ok=True)
+    line = json.dumps(rec, ensure_ascii=False) + "\n"
+    with open(LOG, "a", encoding="utf-8") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        f.write(line)
+        fcntl.flock(f, fcntl.LOCK_UN)
+    sys.stderr.write("logged\n")
+
+
+if __name__ == "__main__":
+    main()

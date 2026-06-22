@@ -1,0 +1,155 @@
+# jobs.yaml — declarative LaunchAgent job set for the agent-harness.
+#
+# install-launchagents.sh renders each job through plist.template into
+# ~/Library/LaunchAgents/<label>.plist and loads it. Edit here, re-run the
+# installer; it's idempotent.
+#
+# Schedule forms:
+#   interval: <seconds>     -> StartInterval (run every N seconds)
+#   calendar: [ {Hour: H, Minute: M, Weekday: W}, ... ]
+#                           -> StartCalendarInterval (one dict per entry;
+#                              omit a field to mean "every"). Weekday 0 = Sunday.
+#
+# command: a list of argv tokens. Most jobs route through the skill-wrapper so
+# the run is logged to the skill-runs ledger and attributed to an agent:
+#
+#   ${OPENCLAW_HOME}/bin/skill-wrapper
+#     --skill <skill-name> --agent <agent> --trigger launchd --
+#     ${OPENCLAW_HOME}/bin/<actual-script>
+#
+# ${OPENCLAW_HOME} is the .openclaw install dir; the installer expands it.
+# Note: the repo groups scripts under bin/<category>/, but bootstrap flattens
+# them into ${OPENCLAW_HOME}/bin/, so commands reference the flat basename.
+
+jobs:
+  - label: ai.openclaw.qmd-sync
+    schedule:
+      interval: 1800            # every 30 minutes
+    command:
+      - ${OPENCLAW_HOME}/bin/skill-wrapper
+      - --skill
+      - qmd-sync
+      - --agent
+      - main
+      - --trigger
+      - launchd
+      - --
+      - ${OPENCLAW_HOME}/bin/qmd-sync
+
+  - label: ai.openclaw.memory-promote
+    schedule:
+      calendar:
+        - { Weekday: 1, Hour: 22, Minute: 0 }   # Mon 22:00
+        - { Weekday: 3, Hour: 22, Minute: 0 }   # Wed 22:00
+        - { Weekday: 5, Hour: 22, Minute: 0 }   # Fri 22:00
+    command:
+      - ${OPENCLAW_HOME}/bin/skill-wrapper
+      - --skill
+      - memory-promote
+      - --agent
+      - main
+      - --trigger
+      - launchd
+      - --
+      - ${OPENCLAW_HOME}/bin/memory-promote-sweep
+
+  - label: ai.openclaw.drift-watcher
+    schedule:
+      interval: 3600            # hourly
+    command:
+      - ${OPENCLAW_HOME}/bin/skill-wrapper
+      - --skill
+      - drift-watcher
+      - --agent
+      - main
+      - --trigger
+      - launchd
+      - --
+      - ${OPENCLAW_HOME}/bin/cron-postmortem-watch
+
+  - label: ai.openclaw.drift-analyzer
+    schedule:
+      interval: 7200            # every 2 hours
+    command:
+      - ${OPENCLAW_HOME}/bin/skill-wrapper
+      - --skill
+      - drift-analyzer
+      - --agent
+      - main
+      - --trigger
+      - launchd
+      - --
+      - ${OPENCLAW_HOME}/bin/incident-analyze
+
+  - label: ai.openclaw.invariants-check
+    schedule:
+      calendar:
+        - { Weekday: 0, Hour: 5, Minute: 0 }    # Sun 05:00
+    command:
+      - ${OPENCLAW_HOME}/bin/skill-wrapper
+      - --skill
+      - openclaw-invariants-check
+      - --agent
+      - main
+      - --trigger
+      - launchd
+      - --
+      - ${OPENCLAW_HOME}/bin/openclaw-invariants-check
+
+  - label: ai.openclaw.wiki-lint
+    schedule:
+      calendar:
+        - { Weekday: 0, Hour: 5, Minute: 15 }   # Sun 05:15
+    command:
+      - ${OPENCLAW_HOME}/bin/skill-wrapper
+      - --skill
+      - wiki-lint
+      - --agent
+      - main
+      - --trigger
+      - launchd
+      - --
+      - ${OPENCLAW_HOME}/skills/wiki-lint/bin/wiki-lint.py
+      - --wiki
+      - --json
+
+  - label: ai.openclaw.freshness-watch
+    schedule:
+      calendar:
+        - { Weekday: 0, Hour: 5, Minute: 0 }    # Sun 05:00
+    command:
+      - ${OPENCLAW_HOME}/bin/skill-wrapper
+      - --skill
+      - freshness-watch
+      - --agent
+      - main
+      - --trigger
+      - launchd
+      - --
+      - ${OPENCLAW_HOME}/bin/freshness-watch
+
+  - label: ai.openclaw.frontmatter-backfill
+    schedule:
+      calendar:
+        - { Hour: 3, Minute: 15 }               # daily 03:15
+    command:
+      - ${OPENCLAW_HOME}/bin/skill-wrapper
+      - --skill
+      - frontmatter-backfill
+      - --agent
+      - main
+      - --trigger
+      - launchd
+      - --
+      - ${OPENCLAW_HOME}/bin/openclaw-frontmatter-backfill
+      - --apply
+
+  # claw-sync-all: OPTIONAL / USER-PROVIDED. The DR workspace-mirror sync script
+  # (${OPENCLAW_HOME}/tools/claw-sync-all.sh) is site-specific and does not ship
+  # with the harness, so no job is defined here. If you supply that script, add a
+  # job mirroring the pattern above:
+  #   - label: ai.openclaw.claw-sync-all
+  #     schedule: { interval: 14400 }   # every 4 hours
+  #     command: [ ${OPENCLAW_HOME}/bin/skill-wrapper, --skill, claw-sync-all,
+  #                --agent, main, --trigger, launchd, --,
+  #                ${OPENCLAW_HOME}/tools/claw-sync-all.sh ]

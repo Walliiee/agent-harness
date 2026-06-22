@@ -1,0 +1,271 @@
+#!/usr/bin/env python3
+"""openclaw-frontmatter-retrieval-audit — flag pages with retrieval-weak frontmatter.
+
+`gbrain frontmatter validate` checks structural YAML + the gbrain quartet
+(type/title/tags) but does NOT enforce `description` or `name` — the two
+fields that move retrieval rank the most. This tool fills that gap.
+
+Default: walks every workspace's `wiki/` subdir, reports pages with
+  - missing `description`
+  - description shorter than --warn-len chars (default 60)
+  - description shorter than --fail-len chars (default 30) — counted as FAIL
+  - missing `name`
+
+Output is one-line per finding (default), or JSON with --json. Default exit
+is 0 even on findings (warning mode). Use --strict to exit 1 on any FAIL
+finding. Use --strict-warn to exit 1 on any finding.
+
+Scope:
+  By default audits `wiki/**` paths across all configured workspaces (highest
+  retrieval cost there). Use --scope all to audit every .md file in every
+  workspace. Use --workspace to scope to one.
+
+Usage:
+  openclaw-frontmatter-retrieval-audit                      # wiki/ across all workspaces, warning mode
+  openclaw-frontmatter-retrieval-audit --json               # machine-readable
+  openclaw-frontmatter-retrieval-audit --workspace workspace
+  openclaw-frontmatter-retrieval-audit --strict             # exit 1 on FAIL
+  openclaw-frontmatter-retrieval-audit --top 20             # only the 20 worst (shortest descriptions first)
+  openclaw-frontmatter-retrieval-audit --scope all          # include non-wiki paths too
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from dataclasses import dataclass, asdict
+from pathlib import Path
+
+OPENCLAW_HOME = Path(os.environ.get("OPENCLAW_HOME", os.path.expanduser("~/.openclaw")))
+OPENCLAW = OPENCLAW_HOME
+
+
+def _load_agents_map():
+    """Return list of (agent_id, workspace_dir, persona) from config/agents.map."""
+    here = Path(__file__).resolve()
+    candidates = []
+    env_map = os.environ.get("AGENTS_MAP")
+    if env_map:
+        candidates.append(Path(env_map))
+    candidates.append(OPENCLAW_HOME / "config" / "agents.map")
+    candidates.append(here.parent.parent.parent / "config" / "agents.map")
+    for c in candidates:
+        try:
+            if c.is_file():
+                rows = []
+                for line in c.read_text(encoding="utf-8").splitlines():
+                    line = line.split("#", 1)[0].strip()
+                    if not line:
+                        continue
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        rows.append((parts[0], parts[1], parts[2]))
+                if rows:
+                    return rows
+        except OSError:
+            continue
+    return [("main", "workspace", "Orchestrator"), ("dev", "workspace-dev", "Developer")]
+
+
+AGENTS = _load_agents_map()
+WORKSPACES = [ws for _aid, ws, _persona in AGENTS]
+
+
+@dataclass
+class Finding:
+    workspace: str
+    path: str
+    rel_path: str
+    severity: str  # FAIL | WARN
+    issue: str
+    description_len: int
+    has_name: bool
+
+
+def parse_frontmatter(text: str) -> tuple[dict | None, list[str]]:
+    """Minimal YAML frontmatter parser — handles flat key: value pairs
+    with optional quotes. Returns (dict, hazard_keys) or (None, []).
+
+    hazard_keys: top-level keys whose value is unquoted AND contains
+    ': ' (colon-space) — the form that silently breaks gbrain's YAML
+    parser. Detected at parse time so the FAIL can be surfaced even
+    when our lenient parser would otherwise accept the line."""
+    if not text.startswith("---"):
+        return None, []
+    lines = text.splitlines()
+    if len(lines) < 2:
+        return None, []
+    out: dict = {}
+    hazards: list[str] = []
+    in_fm = False
+    current_key: str | None = None
+    for ln in lines:
+        if ln.strip() == "---":
+            if in_fm:
+                break
+            in_fm = True
+            continue
+        if not in_fm:
+            continue
+        if not ln.strip():
+            current_key = None
+            continue
+        if ln.startswith(" ") or ln.startswith("\t"):
+            # continuation / nested — skip for our flat-only purposes
+            continue
+        if ":" not in ln:
+            continue
+        key, _, val = ln.partition(":")
+        key = key.strip()
+        raw_val = val.strip()
+        # Hazard: unquoted value containing ": " (colon-space). PyYAML/js-yaml
+        # treat that as a mapping inside a scalar and either error or truncate.
+        # Quoted (", '), flow-collection ([ {), and block-scalar (| >) starts
+        # are all safe. URLs ('https://...') don't have colon-space.
+        if raw_val and raw_val[0] not in ('"', "'", "[", "{", "|", ">") and ": " in raw_val:
+            hazards.append(key)
+        # Strip outer quotes for the returned value
+        val_stripped = raw_val
+        if (val_stripped.startswith('"') and val_stripped.endswith('"')) or (
+            val_stripped.startswith("'") and val_stripped.endswith("'")
+        ):
+            val_stripped = val_stripped[1:-1]
+        out[key] = val_stripped
+        current_key = key
+    return out, hazards
+
+
+def audit_file(workspace: str, ws_root: Path, p: Path, warn_len: int, fail_len: int) -> list[Finding]:
+    try:
+        text = p.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return []
+    fm, hazards = parse_frontmatter(text)
+    if fm is None:
+        return [
+            Finding(
+                workspace=workspace,
+                path=str(p),
+                rel_path=str(p.relative_to(ws_root)),
+                severity="FAIL",
+                issue="no-frontmatter",
+                description_len=0,
+                has_name=False,
+            )
+        ]
+    findings: list[Finding] = []
+    for hkey in hazards:
+        findings.append(
+            Finding(workspace, str(p), str(p.relative_to(ws_root)), "FAIL",
+                    f"yaml-hazard-unquoted-colon:{hkey}", len(fm.get(hkey, "")), bool(fm.get("name")))
+        )
+    desc = fm.get("description", "").strip()
+    name = fm.get("name", "").strip()
+    desc_len = len(desc)
+    if desc_len == 0:
+        findings.append(
+            Finding(workspace, str(p), str(p.relative_to(ws_root)), "FAIL", "missing-description", 0, bool(name))
+        )
+    elif desc_len < fail_len:
+        findings.append(
+            Finding(workspace, str(p), str(p.relative_to(ws_root)), "FAIL", f"description-too-short<{fail_len}", desc_len, bool(name))
+        )
+    elif desc_len < warn_len:
+        findings.append(
+            Finding(workspace, str(p), str(p.relative_to(ws_root)), "WARN", f"description-short<{warn_len}", desc_len, bool(name))
+        )
+    if not name and desc_len > 0:
+        findings.append(
+            Finding(workspace, str(p), str(p.relative_to(ws_root)), "WARN", "missing-name", desc_len, False)
+        )
+    return findings
+
+
+def walk(ws_root: Path, scope: str):
+    if scope == "wiki":
+        base = ws_root / "wiki"
+        if not base.exists():
+            return
+        for p in base.rglob("*.md"):
+            if p.is_file() and "cold-storage" not in p.parts:
+                yield p
+    else:
+        for p in ws_root.rglob("*.md"):
+            if p.is_file() and "cold-storage" not in p.parts and "/.git/" not in str(p):
+                yield p
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--workspace", choices=WORKSPACES, help="scope to one workspace")
+    ap.add_argument("--scope", choices=["wiki", "all"], default="wiki",
+                    help="wiki = wiki/ paths only (default), all = every .md")
+    ap.add_argument("--file", dest="file", help="audit a single file (skips workspace walk)")
+    ap.add_argument("--warn-len", type=int, default=60, help="warning threshold for description length")
+    ap.add_argument("--fail-len", type=int, default=30, help="fail threshold for description length")
+    ap.add_argument("--strict", action="store_true", help="exit 1 if any FAIL findings")
+    ap.add_argument("--strict-warn", action="store_true", help="exit 1 if any findings at all")
+    ap.add_argument("--json", dest="as_json", action="store_true", help="machine-readable output")
+    ap.add_argument("--top", type=int, help="only show the N worst (shortest descriptions first)")
+    args = ap.parse_args()
+
+    findings: list[Finding] = []
+
+    if args.file:
+        p = Path(args.file).resolve()
+        if not p.exists():
+            print(f"FAIL\t-\tfile-not-found\t-\t-\t{args.file}", file=sys.stderr)
+            return 1
+        # Find which workspace this file belongs to (for relative-path display)
+        ws = "-"
+        ws_root = p.parent
+        for w in WORKSPACES:
+            wp = OPENCLAW / w
+            try:
+                p.relative_to(wp)
+                ws = w
+                ws_root = wp
+                break
+            except ValueError:
+                continue
+        findings.extend(audit_file(ws, ws_root, p, args.warn_len, args.fail_len))
+    else:
+        workspaces = [args.workspace] if args.workspace else WORKSPACES
+        for ws in workspaces:
+            ws_root = OPENCLAW / ws
+            if not ws_root.exists():
+                continue
+            for p in walk(ws_root, args.scope):
+                findings.extend(audit_file(ws, ws_root, p, args.warn_len, args.fail_len))
+
+    # Sort: FAIL before WARN, then shortest description first (worst signal first)
+    sev_order = {"FAIL": 0, "WARN": 1}
+    findings.sort(key=lambda f: (sev_order[f.severity], f.description_len, f.rel_path))
+
+    if args.top:
+        findings = findings[: args.top]
+
+    fail_count = sum(1 for f in findings if f.severity == "FAIL")
+    warn_count = sum(1 for f in findings if f.severity == "WARN")
+
+    if args.as_json:
+        print(json.dumps({
+            "fail_count": fail_count,
+            "warn_count": warn_count,
+            "findings": [asdict(f) for f in findings],
+        }, indent=2))
+    else:
+        for f in findings:
+            print(f"{f.severity}\t{f.workspace}\t{f.issue}\tlen={f.description_len}\tname={f.has_name}\t{f.rel_path}")
+        print(f"\n# Summary: {fail_count} FAIL, {warn_count} WARN", file=sys.stderr)
+
+    if args.strict_warn and (fail_count or warn_count):
+        return 1
+    if args.strict and fail_count:
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

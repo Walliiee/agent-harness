@@ -1,0 +1,524 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Part of agent-harness (https://github.com/${GH_ORG}/agent-harness)
+"""skill-run ledger CLI — start, end, list, show.
+
+Every top-level skill invocation gets a record. Cross-links with incidents/ via run_id.
+Schema: ${OPENCLAW_HOME}/skill-runs/README.md
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+OPENCLAW_HOME = Path(os.environ.get("OPENCLAW_HOME", os.path.expanduser("~/.openclaw")))
+ROOT = Path(os.environ.get("OPENCLAW_SKILL_RUNS_DIR", str(OPENCLAW_HOME / "skill-runs")))
+STATE_FILE = ROOT / "state.json"
+BIN_DIR = Path(os.environ.get("OPENCLAW_BIN_DIR", str(OPENCLAW_HOME / "bin")))
+HYPOTHESIS_CMD = BIN_DIR / "hypothesis-current"
+
+
+def _load_agents_map():
+    """Return list of (agent_id, workspace_dir, persona) from config/agents.map."""
+    here = Path(__file__).resolve()
+    candidates = []
+    env_map = os.environ.get("AGENTS_MAP")
+    if env_map:
+        candidates.append(Path(env_map))
+    candidates.append(OPENCLAW_HOME / "config" / "agents.map")
+    candidates.append(here.parent.parent.parent / "config" / "agents.map")
+    for c in candidates:
+        try:
+            if c.is_file():
+                rows = []
+                for line in c.read_text(encoding="utf-8").splitlines():
+                    line = line.split("#", 1)[0].strip()
+                    if not line:
+                        continue
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        rows.append((parts[0], parts[1], parts[2]))
+                if rows:
+                    return rows
+        except OSError:
+            continue
+    return [("main", "workspace", "Orchestrator"), ("dev", "workspace-dev", "Developer")]
+
+
+AGENTS = _load_agents_map()
+# Valid agents = agent ids from config/agents.map.
+VALID_AGENTS = {aid for aid, _ws, _p in AGENTS}
+VALID_TRIGGERS = {"cron", "interactive", "nested"}
+VALID_OUTCOMES = {"success", "degraded", "failure", "in_flight"}
+
+FRONTMATTER_RE = re.compile(r"^---\n(.*?)\n---\n(.*)$", re.DOTALL)
+
+
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def iso(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def day_dir(dt: datetime) -> Path:
+    return ROOT / dt.strftime("%Y-%m-%d")
+
+
+def gen_run_id(dt: datetime) -> str:
+    rand = hashlib.sha1(os.urandom(16)).hexdigest()[:6]
+    return f"r-{dt.strftime('%Y%m%d-%H%M%S')}-{rand}"
+
+
+def slug(s: str, maxlen: int = 60) -> str:
+    s = re.sub(r"[^a-zA-Z0-9]+", "-", s).strip("-").lower()
+    return s[:maxlen] or "untitled"
+
+
+# ---------- YAML I/O (matches bin/incident style) ----------
+
+def dump_yaml(d: dict[str, Any]) -> str:
+    """Serialize top-level keys as YAML lines. Nested dicts/lists inlined as JSON
+    for round-trip safety (matches bin/incident convention)."""
+    lines = []
+    for k, v in d.items():
+        if v is None:
+            lines.append(f"{k}: null")
+        elif isinstance(v, bool):
+            lines.append(f"{k}: {'true' if v else 'false'}")
+        elif isinstance(v, (int, float)):
+            lines.append(f"{k}: {v}")
+        elif isinstance(v, str):
+            if v == "" or any(c in v for c in ":#\n\"'") or v.strip() != v:
+                lines.append(f"{k}: {json.dumps(v)}")
+            else:
+                lines.append(f"{k}: {v}")
+        elif isinstance(v, (dict, list)):
+            lines.append(f"{k}: {json.dumps(v, ensure_ascii=False)}")
+        else:
+            lines.append(f"{k}: {json.dumps(str(v))}")
+    return "\n".join(lines)
+
+
+def _scalar(v: str) -> Any:
+    if v == "null" or v == "~":
+        return None
+    if v == "true":
+        return True
+    if v == "false":
+        return False
+    if v.startswith('"') and v.endswith('"'):
+        try:
+            return json.loads(v)
+        except json.JSONDecodeError:
+            return v[1:-1]
+    if v.startswith("{") or v.startswith("["):
+        try:
+            return json.loads(v)
+        except json.JSONDecodeError:
+            return v
+    try:
+        return int(v)
+    except ValueError:
+        pass
+    try:
+        return float(v)
+    except ValueError:
+        pass
+    return v
+
+
+def parse_frontmatter(text: str) -> tuple[dict[str, Any], str]:
+    m = FRONTMATTER_RE.match(text)
+    if not m:
+        raise ValueError("missing frontmatter")
+    fm_text, body = m.group(1), m.group(2)
+    fm: dict[str, Any] = {}
+    stack: list[tuple[int, dict | list]] = [(0, fm)]
+    for raw_line in fm_text.split("\n"):
+        if not raw_line.strip():
+            continue
+        indent = len(raw_line) - len(raw_line.lstrip(" "))
+        line = raw_line.strip()
+        while stack and stack[-1][0] >= indent and len(stack) > 1:
+            stack.pop()
+        container = stack[-1][1]
+        if line.startswith("- "):
+            val = _scalar(line[2:].strip())
+            assert isinstance(container, list)
+            container.append(val)
+            continue
+        if ":" not in line:
+            continue
+        k, _, v = line.partition(":")
+        k = k.strip()
+        v = v.strip()
+        if v == "":
+            new_container: dict | list = {}
+            container[k] = new_container  # type: ignore[index]
+            stack.append((indent + 2, new_container))
+        else:
+            container[k] = _scalar(v)  # type: ignore[index]
+    return fm, body
+
+
+# ---------- atomic file writes ----------
+
+def atomic_write(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".tmp-", suffix=path.suffix)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def load_state() -> dict[str, Any]:
+    if not STATE_FILE.exists():
+        return {"schema_version": 1, "per_skill": {}, "in_flight": {}}
+    try:
+        return json.loads(STATE_FILE.read_text())
+    except json.JSONDecodeError:
+        # Don't clobber a corrupted state file silently; warn and start fresh
+        print(f"WARN: state.json corrupted, starting fresh", file=sys.stderr)
+        return {"schema_version": 1, "per_skill": {}, "in_flight": {}}
+
+
+def save_state(state: dict[str, Any]) -> None:
+    atomic_write(STATE_FILE, json.dumps(state, indent=2) + "\n")
+
+
+# ---------- records ----------
+
+@dataclass
+class Run:
+    run_id: str
+    path: Path
+    fm: dict[str, Any]
+    body: str
+
+    @classmethod
+    def load(cls, path: Path) -> "Run":
+        fm, body = parse_frontmatter(path.read_text())
+        return cls(run_id=fm["run_id"], path=path, fm=fm, body=body)
+
+    def save(self) -> None:
+        text = "---\n" + dump_yaml(self.fm) + "\n---\n" + self.body
+        atomic_write(self.path, text)
+
+
+def find_run(run_id: str) -> Run | None:
+    if not ROOT.exists():
+        return None
+    for day in sorted(ROOT.iterdir(), reverse=True):
+        if not day.is_dir() or not re.match(r"\d{4}-\d{2}-\d{2}", day.name):
+            continue
+        candidate = day / f"{run_id}.md"
+        if candidate.exists():
+            return Run.load(candidate)
+    return None
+
+
+def all_runs() -> list[Run]:
+    out: list[Run] = []
+    if not ROOT.exists():
+        return out
+    for day in sorted(ROOT.iterdir()):
+        if not day.is_dir() or not re.match(r"\d{4}-\d{2}-\d{2}", day.name):
+            continue
+        for f in sorted(day.glob("*.md")):
+            try:
+                out.append(Run.load(f))
+            except Exception as e:
+                print(f"WARN: failed to load {f}: {e}", file=sys.stderr)
+    return out
+
+
+# ---------- hypothesis lookup (optional) ----------
+
+def lookup_hypothesis(agent: str, skill: str) -> str | None:
+    if not HYPOTHESIS_CMD.exists():
+        return None
+    try:
+        result = subprocess.run(
+            [str(HYPOTHESIS_CMD), "--agent", agent, "--skill", skill],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+    return None
+
+
+# ---------- commands ----------
+
+def cmd_start(args: argparse.Namespace) -> int:
+    if args.agent not in VALID_AGENTS:
+        print(f"ERROR: unknown agent {args.agent}; valid: {sorted(VALID_AGENTS)}", file=sys.stderr)
+        return 2
+    if args.trigger not in VALID_TRIGGERS:
+        print(f"ERROR: unknown trigger {args.trigger}; valid: {sorted(VALID_TRIGGERS)}", file=sys.stderr)
+        return 2
+
+    started = now_utc()
+    run_id = gen_run_id(started)
+    hypothesis_ref = lookup_hypothesis(args.agent, args.skill)
+
+    fm: dict[str, Any] = {
+        "run_id": run_id,
+        "skill": args.skill,
+        "agent": args.agent,
+        "trigger": args.trigger,
+        "parent_run_id": args.parent_run_id,
+        "started_at": iso(started),
+        "ended_at": None,
+        "duration_ms": None,
+        "outcome": "in_flight",
+        "score": {
+            "task_completion": None,
+            "error_recovery": None,
+            "cost_tokens": None,
+            "cost_usd": None,
+        },
+        "score_evidence": {
+            "completion_check": None,
+            "recovery_check": None,
+        },
+        "incident_id": None,
+        "hypothesis_ref": hypothesis_ref,
+        "verify_status": "pending" if hypothesis_ref else None,
+        "exit_code": None,
+    }
+
+    body = f"\n# {args.skill} — in_flight — {iso(started)}\n\n## Trajectory\n_pending_\n\n## Evidence\n_pending_\n\n## Notes\n_pending_\n"
+    path = day_dir(started) / f"{run_id}.md"
+    text = "---\n" + dump_yaml(fm) + "\n---\n" + body
+    atomic_write(path, text)
+
+    state = load_state()
+    state.setdefault("in_flight", {})[run_id] = {
+        "skill": args.skill,
+        "agent": args.agent,
+        "started_at": iso(started),
+        "path": str(path),
+    }
+    save_state(state)
+
+    print(run_id)
+    return 0
+
+
+def cmd_end(args: argparse.Namespace) -> int:
+    run = find_run(args.run_id)
+    if run is None:
+        print(f"ERROR: run not found: {args.run_id}", file=sys.stderr)
+        return 1
+
+    if args.outcome not in VALID_OUTCOMES:
+        print(f"ERROR: invalid outcome {args.outcome}; valid: {sorted(VALID_OUTCOMES)}", file=sys.stderr)
+        return 2
+
+    ended = now_utc()
+    started = datetime.strptime(run.fm["started_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    duration_ms = int((ended - started).total_seconds() * 1000)
+
+    run.fm["ended_at"] = iso(ended)
+    run.fm["duration_ms"] = duration_ms
+    run.fm["outcome"] = args.outcome
+    if args.exit_code is not None:
+        run.fm["exit_code"] = args.exit_code
+
+    score = run.fm.setdefault("score", {})
+    if args.task_completion is not None:
+        score["task_completion"] = args.task_completion
+    if args.error_recovery is not None:
+        score["error_recovery"] = args.error_recovery
+    if args.cost_tokens is not None:
+        score["cost_tokens"] = args.cost_tokens
+
+    evidence = run.fm.setdefault("score_evidence", {})
+    if args.completion_evidence is not None:
+        evidence["completion_check"] = args.completion_evidence
+    if args.recovery_evidence is not None:
+        evidence["recovery_check"] = args.recovery_evidence
+
+    if args.incident_id is not None:
+        run.fm["incident_id"] = args.incident_id
+
+    # Update body header to reflect outcome
+    run.body = re.sub(
+        r"^# (.+?) — in_flight — ",
+        rf"# \1 — {args.outcome} — ",
+        run.body,
+        count=1,
+        flags=re.MULTILINE,
+    )
+
+    run.save()
+
+    state = load_state()
+    state.setdefault("in_flight", {}).pop(args.run_id, None)
+    per_skill = state.setdefault("per_skill", {})
+    per_skill[run.fm["skill"]] = {
+        "last_run_id": args.run_id,
+        "last_started_at": run.fm["started_at"],
+        "last_ended_at": iso(ended),
+        "last_outcome": args.outcome,
+    }
+    save_state(state)
+
+    print(args.run_id)
+    return 0
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    runs = all_runs()
+    if args.agent:
+        runs = [r for r in runs if r.fm.get("agent") == args.agent]
+    if args.skill:
+        runs = [r for r in runs if r.fm.get("skill") == args.skill]
+    if args.outcome:
+        runs = [r for r in runs if r.fm.get("outcome") == args.outcome]
+    if args.since:
+        runs = [r for r in runs if r.fm.get("started_at", "") >= args.since]
+    runs.sort(key=lambda r: r.fm.get("started_at", ""), reverse=True)
+    if args.limit:
+        runs = runs[:args.limit]
+
+    for r in runs:
+        outcome = r.fm.get("outcome", "?")
+        skill = r.fm.get("skill", "?")
+        agent = r.fm.get("agent", "?")
+        started = r.fm.get("started_at", "?")
+        duration = r.fm.get("duration_ms")
+        dur_s = f"{duration/1000:.1f}s" if isinstance(duration, (int, float)) else "-"
+        score = r.fm.get("score") or {}
+        tc = score.get("task_completion")
+        er = score.get("error_recovery")
+        tc_s = "✓" if tc is True else ("✗" if tc is False else "?")
+        er_s = "✓" if er is True else ("✗" if er is False else "?")
+        print(f"{started}  {outcome:9} {agent:8} {skill:30} {dur_s:>7}  TC:{tc_s} ER:{er_s}  {r.run_id}")
+    return 0
+
+
+def cmd_show(args: argparse.Namespace) -> int:
+    run = find_run(args.run_id)
+    if run is None:
+        print(f"ERROR: run not found: {args.run_id}", file=sys.stderr)
+        return 1
+    print(run.path.read_text())
+    return 0
+
+
+def cmd_reap(args: argparse.Namespace) -> int:
+    """Reap orphaned in_flight runs older than --max-age seconds."""
+    cutoff = time.time() - args.max_age
+    reaped = []
+    # Snapshot the current in_flight set; cmd_end mutates state.json as we go.
+    in_flight_snapshot = list(load_state().get("in_flight", {}).items())
+    for run_id, info in in_flight_snapshot:
+        try:
+            started = datetime.strptime(info["started_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        except (KeyError, ValueError):
+            continue
+        if started.timestamp() >= cutoff:
+            continue
+        run = find_run(run_id)
+        if run is not None:
+            end_args = argparse.Namespace(
+                run_id=run_id, outcome="failure",
+                task_completion=False, error_recovery=False,
+                cost_tokens=None, exit_code=-1,
+                completion_evidence="reaped: skill-run end never fired",
+                recovery_evidence=None, incident_id=None,
+            )
+            cmd_end(end_args)
+            reaped.append(run_id)
+        else:
+            # Record file gone — clear the orphan state entry directly.
+            state = load_state()
+            if state.get("in_flight", {}).pop(run_id, None) is not None:
+                save_state(state)
+            reaped.append(run_id)
+    if reaped:
+        print(f"reaped {len(reaped)} orphan(s): {', '.join(reaped)}")
+    return 0
+
+
+# ---------- arg parsing ----------
+
+def _bool_or_none(s: str) -> bool | None:
+    if s.lower() in ("true", "1", "yes"):
+        return True
+    if s.lower() in ("false", "0", "no"):
+        return False
+    if s.lower() in ("null", "none", ""):
+        return None
+    raise argparse.ArgumentTypeError(f"expected true/false/null, got {s}")
+
+
+def main(argv: list[str]) -> int:
+    p = argparse.ArgumentParser(prog="skill-run", description="skill-run ledger")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    p_start = sub.add_parser("start", help="begin a run; prints run_id")
+    p_start.add_argument("--skill", required=True)
+    p_start.add_argument("--agent", required=True)
+    p_start.add_argument("--trigger", default="interactive")
+    p_start.add_argument("--parent-run-id", default=None)
+    p_start.set_defaults(func=cmd_start)
+
+    p_end = sub.add_parser("end", help="finalize a run")
+    p_end.add_argument("run_id")
+    p_end.add_argument("--outcome", required=True)
+    p_end.add_argument("--task-completion", type=_bool_or_none, default=None)
+    p_end.add_argument("--error-recovery", type=_bool_or_none, default=None)
+    p_end.add_argument("--cost-tokens", type=int, default=None)
+    p_end.add_argument("--exit-code", type=int, default=None)
+    p_end.add_argument("--completion-evidence", default=None)
+    p_end.add_argument("--recovery-evidence", default=None)
+    p_end.add_argument("--incident-id", default=None)
+    p_end.set_defaults(func=cmd_end)
+
+    p_list = sub.add_parser("list", help="list runs (filterable)")
+    p_list.add_argument("--agent")
+    p_list.add_argument("--skill")
+    p_list.add_argument("--outcome")
+    p_list.add_argument("--since", help="ISO date; show runs started_at >= this")
+    p_list.add_argument("--limit", type=int, default=50)
+    p_list.set_defaults(func=cmd_list)
+
+    p_show = sub.add_parser("show", help="show one run")
+    p_show.add_argument("run_id")
+    p_show.set_defaults(func=cmd_show)
+
+    p_reap = sub.add_parser("reap", help="finalize orphaned in_flight runs")
+    p_reap.add_argument("--max-age", type=int, default=1800, help="seconds; default 30min")
+    p_reap.set_defaults(func=cmd_reap)
+
+    args = p.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

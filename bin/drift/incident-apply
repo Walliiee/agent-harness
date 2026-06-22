@@ -1,0 +1,982 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Part of agent-harness (https://github.com/${GH_ORG}/agent-harness)
+"""Drift incident apply (phase 3b).
+
+For an `approved-<letter>` incident: dispatch the chosen option's structured
+`apply` plan to a handler, verify pre/post state, and update status to
+`applied`. Idempotent — if the change is already in place, marks the incident
+as applied without re-executing.
+
+Usage:
+  incident-apply <id>                  # apply the approved option
+  incident-apply <id> --dry-run        # show what would happen, no writes
+  incident-apply --all-approved        # apply every approved-* incident
+  incident-apply <id> --no-post        # skip Drift ack
+
+Handlers:
+  cron-edit          : openclaw cron edit <id> --model X / --cron X / ...
+  file-patch         : exact old_string→new_string replacement under allowlisted roots
+                       (skill files under ~/.openclaw/skills/ are also covered here)
+  routing-fix        : deep-merge into openclaw.json (channels.* or routing.* subtrees only)
+  investigate, infrastructure : no-op (just mark applied with note)
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+# OPENCLAW_HOME: root of the agent runtime (default ~/.openclaw, override via env).
+OPENCLAW_HOME = Path(os.environ.get("OPENCLAW_HOME", os.path.expanduser("~/.openclaw")))
+
+ROOT = Path(os.environ.get("OPENCLAW_INCIDENTS_DIR", str(OPENCLAW_HOME / "incidents")))
+OPENCLAW = os.environ.get("OPENCLAW_BIN", "openclaw")
+PLANNER_MODEL = os.environ.get("DRIFT_PLANNER_MODEL", "ollama/glm-5.1:cloud")
+TIMEOUT_S = int(os.environ.get("DRIFT_PLANNER_TIMEOUT", "120"))
+
+# Telegram routing for the Drift ack post. Both default to empty; when DRIFT_CHAT
+# is empty the send step becomes a no-op (see post_drift).
+#   HARNESS_TG_CHAT_ID          -> chat/group id to post the ack into
+#   HARNESS_TG_DRIFT_TOPIC_ID   -> topic/thread id within that chat
+DRIFT_CHAT = os.environ.get("HARNESS_TG_CHAT_ID", "")
+DRIFT_THREAD = os.environ.get("HARNESS_TG_DRIFT_TOPIC_ID", "")
+DRIFT_ACCOUNT = os.environ.get("DRIFT_ACCOUNT", "main")
+
+FRONTMATTER_RE = re.compile(r"^---\n(.*?)\n---\n(.*)$", re.DOTALL)
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# ---------- agents map ----------
+
+def _load_agents_map():
+    """Return list of (agent_id, workspace_dir, persona) from config/agents.map."""
+    here = Path(__file__).resolve()
+    candidates = []
+    env_map = os.environ.get("AGENTS_MAP")
+    if env_map:
+        candidates.append(Path(env_map))
+    candidates.append(OPENCLAW_HOME / "config" / "agents.map")
+    candidates.append(here.parent.parent.parent / "config" / "agents.map")
+    for c in candidates:
+        try:
+            if c.is_file():
+                rows = []
+                for line in c.read_text(encoding="utf-8").splitlines():
+                    line = line.split("#", 1)[0].strip()
+                    if not line:
+                        continue
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        rows.append((parts[0], parts[1], parts[2]))
+                if rows:
+                    return rows
+        except OSError:
+            continue
+    return [("main", "workspace", "Orchestrator"), ("dev", "workspace-dev", "Developer")]
+
+
+AGENTS = _load_agents_map()
+
+
+# ---------- file + frontmatter I/O (mirrors incident-analyze for round-trip safety) ----------
+
+def parse_frontmatter(text: str) -> tuple[dict, str]:
+    m = FRONTMATTER_RE.match(text)
+    if not m:
+        raise ValueError("missing frontmatter")
+    fm_text, body = m.group(1), m.group(2)
+    fm: dict = {}
+    for raw_line in fm_text.split("\n"):
+        if not raw_line.strip() or raw_line.startswith(" "):
+            continue
+        if ":" not in raw_line:
+            continue
+        k, _, v = raw_line.partition(":")
+        k, v = k.strip(), v.strip()
+        fm[k] = _scalar(v)
+    return fm, body
+
+
+def _scalar(v: str):
+    if v in ("null", "~", ""):
+        return None
+    if v == "true":
+        return True
+    if v == "false":
+        return False
+    if v.startswith('"') and v.endswith('"'):
+        try:
+            return json.loads(v)
+        except json.JSONDecodeError:
+            return v[1:-1]
+    if v.startswith("{") or v.startswith("["):
+        try:
+            return json.loads(v)
+        except json.JSONDecodeError:
+            return v
+    try:
+        return int(v)
+    except ValueError:
+        pass
+    try:
+        return float(v)
+    except ValueError:
+        pass
+    return v
+
+
+def dump_yaml(d: dict) -> str:
+    lines = []
+    for k, v in d.items():
+        if v is None:
+            lines.append(f"{k}: null")
+        elif isinstance(v, bool):
+            lines.append(f"{k}: {'true' if v else 'false'}")
+        elif isinstance(v, (int, float)):
+            lines.append(f"{k}: {v}")
+        elif isinstance(v, str):
+            if v == "" or any(c in v for c in ":#\n\"'") or v.strip() != v:
+                lines.append(f"{k}: {json.dumps(v)}")
+            else:
+                lines.append(f"{k}: {v}")
+        elif isinstance(v, (dict, list)):
+            lines.append(f"{k}: {json.dumps(v, ensure_ascii=False)}")
+        else:
+            lines.append(f"{k}: {json.dumps(str(v))}")
+    return "\n".join(lines)
+
+
+def iter_incidents() -> list[Path]:
+    out = []
+    if not ROOT.exists():
+        return out
+    for day in sorted(ROOT.iterdir()):
+        if not day.is_dir() or not re.match(r"\d{4}-\d{2}-\d{2}", day.name):
+            continue
+        out.extend(sorted(day.glob("*.md")))
+    return out
+
+
+def find_by_id(inc_id: str) -> Path | None:
+    for f in iter_incidents():
+        try:
+            fm, _ = parse_frontmatter(f.read_text())
+        except Exception:
+            continue
+        if fm.get("id") == inc_id or (fm.get("id") or "").endswith(inc_id):
+            return f
+    return None
+
+
+# ---------- planner: ensure chosen option has structured `apply` block ----------
+
+PLANNER_PROMPT_TEMPLATE = """You convert a free-text incident remediation option into a structured `apply` plan.
+
+INCIDENT CONTEXT:
+{incident_view}
+
+CHOSEN OPTION ({choice}):
+{option_json}
+
+JOB / TARGET PAYLOAD (if present, for grounding):
+{target_view}
+
+Pick exactly one handler:
+- cron-edit       : `openclaw cron edit <id> --<flag> <value>`. Use when the fix is to change a cron's model, schedule, agent, or any flag exposed by `openclaw cron edit`.
+- file-patch      : Patch a known file (skill, template, prompt). Defer execution.
+- routing-fix     : Telegram routing / agent binding change. Defer execution.
+- skill-patch     : Patch a SKILL.md or skill code. Defer execution.
+- investigate     : No automated change. Note what to investigate.
+- infrastructure  : Manual/external infra change required (e.g., restart gateway).
+
+CRITICAL IDEMPOTENCY RULE — read this carefully:
+The option text often describes a state transition like "switch FROM problem_value TO desired_value".
+If `target_view` shows the system is ALREADY in a state that addresses the problem
+(e.g., the model is no longer the one flagged as bad), treat the change as ALREADY APPLIED:
+  → Set `params.changes.<field>` to the CURRENT value from `target_view` (do not "improve" it).
+  → Set `preflight.equals` to that same current value.
+This makes the apply idempotent and prevents re-litigating decisions the user has already made out-of-band.
+Only propose a NEW target value if the current state still exhibits the problem.
+
+Return a single JSON object — no fences, no preamble:
+{{
+  "handler": "<one of the above>",
+  "params": {{
+    /* handler-specific fields, see below */
+  }},
+  "preflight": {{
+    "command": "<bash command to read current state for idempotency check>",
+    "jsonpath": "<dot path into JSON output, e.g. 'payload.model'>",
+    "equals": "<value that means 'already applied' = the desired end state>"
+  }} | null,
+  "rationale": "<one short line; why this handler/params, including whether current state already satisfies>"
+}}
+
+Handler-specific `params`:
+- cron-edit: {{ "cron_id": "<uuid>", "changes": {{ "model": "ollama/glm-5.1:cloud", "cron": "...", ... }} }}
+  Only include fields you actually want to change. Use the FULL model string with provider prefix.
+- file-patch: {{ "path": "<absolute path>", "intent": "<one-line description of the change>" }}
+- routing-fix: {{ "description": "<one-line>" }}
+- skill-patch: {{ "path": "<absolute path>", "intent": "<one-line>" }}
+- investigate: {{ "next_step": "<one-line concrete next action>" }}
+- infrastructure: {{ "manual_step": "<one-line; what the human needs to do>" }}
+
+For cron-edit, ALWAYS emit a preflight that reads `openclaw cron show <cron_id> --json` and checks the `jsonpath` matches `equals`.
+
+Output the JSON only.
+"""
+
+
+def call_planner(prompt: str) -> dict:
+    cmd = [OPENCLAW, "infer", "model", "run", "--model", PLANNER_MODEL, "--thinking", "off", "--prompt", prompt, "--json"]
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=TIMEOUT_S)
+    if p.returncode != 0:
+        raise RuntimeError(f"planner failed: {p.stderr.strip() or p.stdout.strip()}")
+    envelope = json.loads(p.stdout)
+    text = (envelope.get("outputs") or [{}])[0].get("text", "")
+    text = re.sub(r"^```(?:json)?\s*", "", text.strip())
+    text = re.sub(r"\s*```$", "", text.strip())
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        m = re.search(r"\{.*\}", text, re.DOTALL)
+        if not m:
+            raise RuntimeError(f"could not parse JSON from planner:\n{text[:500]}")
+        return json.loads(m.group(0))
+
+
+def ensure_apply_block(fm: dict, body: str, choice: str) -> tuple[dict, dict]:
+    """Return (chosen_option, apply_block). Generates apply via LLM if missing."""
+    proposal = fm.get("proposed_fix") or {}
+    options = proposal.get("options") or []
+    opt = next((o for o in options if o.get("label") == choice), None)
+    if not opt:
+        raise RuntimeError(f"chosen option {choice!r} not in proposal")
+    if isinstance(opt.get("apply"), dict):
+        return opt, opt["apply"]
+
+    # Build context for the planner.
+    incident_view = {k: fm.get(k) for k in ("id", "type", "source", "agent", "title", "fields", "related")}
+    target_view: dict = {}
+    if fm.get("source") == "cron":
+        # Cron id is encoded in the dedup_key as `cron-<uuid>-<run-ts>` or as a top-level field.
+        cron_id = None
+        if isinstance(fm.get("fields"), dict):
+            cron_id = fm["fields"].get("job_id") or fm["fields"].get("cron_id")
+        if not cron_id:
+            m = re.search(r"job_id:\s*([0-9a-f-]{36})", body)
+            if m:
+                cron_id = m.group(1)
+        if cron_id:
+            try:
+                p = subprocess.run([OPENCLAW, "cron", "show", cron_id, "--json"], capture_output=True, text=True, timeout=30)
+                if p.returncode == 0:
+                    cron_doc = json.loads(p.stdout)
+                    target_view = {
+                        "cron_id": cron_id,
+                        "name": cron_doc.get("name"),
+                        "agent": cron_doc.get("agentId"),
+                        "current_model": (cron_doc.get("payload") or {}).get("model"),
+                        "schedule": (cron_doc.get("schedule") or {}).get("expr"),
+                    }
+            except Exception:
+                pass
+
+    prompt = PLANNER_PROMPT_TEMPLATE.format(
+        incident_view=json.dumps(incident_view, indent=2),
+        choice=choice,
+        option_json=json.dumps(opt, indent=2),
+        target_view=json.dumps(target_view, indent=2) if target_view else "(none)",
+    )
+    apply_block = call_planner(prompt)
+    return opt, apply_block
+
+
+# ---------- preflight (idempotency check) ----------
+
+def jsonpath_get(doc, path: str):
+    cur = doc
+    for seg in path.split("."):
+        if isinstance(cur, dict):
+            cur = cur.get(seg)
+        elif isinstance(cur, list):
+            try:
+                cur = cur[int(seg)]
+            except (ValueError, IndexError):
+                return None
+        else:
+            return None
+    return cur
+
+
+def preflight_already_applied(apply_block: dict) -> tuple[bool, str]:
+    pf = apply_block.get("preflight")
+    if not isinstance(pf, dict):
+        return False, "no preflight"
+    # Dispatch by type. Default to command-jsonpath for backward compat.
+    pf_type = pf.get("type") or "command-jsonpath"
+
+    if pf_type == "string-in-file":
+        target = pf.get("path")
+        needle = pf.get("string")
+        if not target or needle is None:
+            return False, "string-in-file preflight missing path/string"
+        try:
+            tp = Path(target)
+            ok, why = _file_patch_path_check(tp)
+            if not ok:
+                return False, f"string-in-file refused: {why}"
+            if not tp.exists():
+                return False, f"string-in-file: target does not exist: {tp}"
+            content = tp.read_text()
+            if needle in content:
+                return True, f"already-applied: string present in {tp.name}"
+            return False, f"will-apply: string absent in {tp.name}"
+        except Exception as e:
+            return False, f"string-in-file preflight error: {e}"
+
+    if pf_type == "file-archived":
+        # Considered already-applied if the source no longer exists.
+        src = pf.get("path")
+        if not src:
+            return False, "file-archived preflight missing path"
+        try:
+            return (not Path(src).exists(), f"src-exists={Path(src).exists()}")
+        except Exception as e:
+            return False, f"file-archived preflight error: {e}"
+
+    if pf_type == "config-equals":
+        cpath = pf.get("path")
+        expected = pf.get("equals")
+        if not cpath or expected is None:
+            return False, "config-equals preflight missing path/equals"
+        # Allowlist preflight paths to channels.*/routing.* — same surface as routing-fix.
+        top = cpath.split(".", 1)[0]
+        if top not in ROUTING_FIX_ALLOWED_TOP:
+            return False, f"config-equals refused: path top {top!r} not in {sorted(ROUTING_FIX_ALLOWED_TOP)}"
+        actual = _read_config_value(cpath)
+        if actual == expected:
+            return True, f"already-applied: config[{cpath}]={actual!r}"
+        return False, f"will-apply: config[{cpath}]={actual!r} → {expected!r}"
+
+    # Default: command-jsonpath
+    cmd = pf.get("command")
+    jp = pf.get("jsonpath")
+    expected = pf.get("equals")
+    if not (cmd and jp and expected is not None):
+        return False, "preflight incomplete"
+    try:
+        # Constrain to safe-looking openclaw commands.
+        if not cmd.strip().startswith(("openclaw ",)):
+            return False, f"refusing preflight command: {cmd!r}"
+        parts = cmd.split()
+        # Append --json if not present (so we can parse).
+        if "--json" not in parts:
+            parts.append("--json")
+        p = subprocess.run(parts, capture_output=True, text=True, timeout=30)
+        if p.returncode != 0:
+            return False, f"preflight failed: {p.stderr.strip()}"
+        doc = json.loads(p.stdout)
+        actual = jsonpath_get(doc, jp)
+        if actual == expected:
+            return True, f"already-applied: {jp}={actual!r}"
+        return False, f"will-apply: {jp}={actual!r} → {expected!r}"
+    except Exception as e:
+        return False, f"preflight error: {e}"
+
+
+# ---------- handlers ----------
+
+# File-patch allow roots: the runtime's editable content trees plus each
+# configured agent's workspace directory (from agents.map). Domain-specific
+# workspaces are picked up automatically as they appear in the map.
+FILE_PATCH_ALLOW_ROOTS = [
+    OPENCLAW_HOME / "agents",
+    OPENCLAW_HOME / "skills",
+    OPENCLAW_HOME / "templates",
+] + [OPENCLAW_HOME / ws for _aid, ws, _persona in AGENTS]
+FILE_PATCH_DENY_PREFIXES = [
+    OPENCLAW_HOME / "bin",
+    OPENCLAW_HOME / "incidents",
+    OPENCLAW_HOME / "openclaw.json",
+    OPENCLAW_HOME / "openclaw.json.last-good",
+]
+
+
+def _file_patch_path_check(p: Path) -> tuple[bool, str]:
+    try:
+        rp = p.resolve()
+    except Exception as e:
+        return False, f"cannot resolve path: {e}"
+    if not rp.is_absolute():
+        return False, "path must be absolute"
+    for deny in FILE_PATCH_DENY_PREFIXES:
+        try:
+            rp.relative_to(deny.resolve())
+            return False, f"path under denied prefix: {deny}"
+        except ValueError:
+            continue
+    for root in FILE_PATCH_ALLOW_ROOTS:
+        try:
+            rp.relative_to(root.resolve())
+            return True, ""
+        except (ValueError, FileNotFoundError):
+            continue
+    return False, f"path not under any allowed root: {FILE_PATCH_ALLOW_ROOTS}"
+
+
+def handler_file_archive(apply_block: dict, dry_run: bool) -> dict:
+    """Move a file to cold-storage/archive/ mirroring its path under the workspace root.
+
+    params: { "path": "<absolute path>", "intent": "<one-line description>" }
+    Preflight type "file-archived": checks that the source no longer exists at original path.
+    """
+    import shutil
+    params = apply_block.get("params") or {}
+    raw_path = params.get("path")
+    if not raw_path:
+        return {"ok": False, "reason": "file-archive missing path"}
+    src = Path(raw_path)
+    ok, why = _file_patch_path_check(src)
+    if not ok:
+        return {"ok": False, "reason": f"path check failed: {why}", "path": str(src)}
+    if not src.exists():
+        return {"ok": False, "reason": "source file does not exist", "path": str(src)}
+
+    # Find the workspace root (one of OPENCLAW_HOME/workspace*) the file lives under.
+    workspace_root = None
+    for cand in FILE_PATCH_ALLOW_ROOTS:
+        try:
+            src.resolve().relative_to(cand.resolve())
+            workspace_root = cand
+            break
+        except (ValueError, FileNotFoundError):
+            continue
+    if not workspace_root:
+        return {"ok": False, "reason": "could not determine workspace root for archive"}
+    # cold-storage destination mirrors the path under workspace_root.
+    cold_root = workspace_root / "cold-storage" / "archive"
+    try:
+        rel = src.resolve().relative_to(workspace_root.resolve())
+    except ValueError:
+        return {"ok": False, "reason": "src not under workspace_root after resolve"}
+    dst = cold_root / rel
+    if dst.exists():
+        return {"ok": False, "reason": f"destination already exists (out-of-band-applied?): {dst}", "already_applied": True}
+
+    if dry_run:
+        return {"ok": True, "dry_run": True, "src": str(src), "dst": str(dst)}
+
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(src), str(dst))
+    return {
+        "ok": True,
+        "src": str(src),
+        "dst": str(dst),
+        "pre_state": {"src": str(src), "dst": str(dst)},
+        "command": f"file-archive {src.name} → cold-storage/archive/{rel}",
+    }
+
+
+def handler_file_patch(apply_block: dict, dry_run: bool) -> dict:
+    params = apply_block.get("params") or {}
+    raw_path = params.get("path")
+    old_string = params.get("old_string")
+    new_string = params.get("new_string")
+    if not raw_path or old_string is None or new_string is None:
+        return {"ok": False, "reason": "file-patch missing path/old_string/new_string"}
+    if old_string == new_string:
+        return {"ok": False, "reason": "file-patch old_string == new_string"}
+
+    p = Path(raw_path)
+    ok, why = _file_patch_path_check(p)
+    if not ok:
+        return {"ok": False, "reason": f"path check failed: {why}", "path": str(p)}
+    if not p.exists() or not p.is_file():
+        return {"ok": False, "stale_target": True, "reason": "target file does not exist", "path": str(p)}
+
+    content = p.read_text()
+    n_occurrences = content.count(old_string)
+    if n_occurrences == 0:
+        if new_string in content:
+            return {"ok": False, "reason": "out-of-band: new_string already present but old_string absent (treat as already applied)", "already_applied": True, "path": str(p)}
+        return {"ok": False, "reason": "old_string not found in target file — needs human investigation", "path": str(p)}
+    if n_occurrences > 1:
+        return {"ok": False, "reason": f"old_string is ambiguous ({n_occurrences} occurrences) — refine with more surrounding context", "path": str(p)}
+
+    pre_mtime = p.stat().st_mtime
+    if dry_run:
+        return {
+            "ok": True, "dry_run": True, "path": str(p),
+            "old_string_len": len(old_string), "new_string_len": len(new_string),
+            "pre_mtime": pre_mtime,
+        }
+
+    new_content = content.replace(old_string, new_string, 1)
+    p.write_text(new_content)
+    post_mtime = p.stat().st_mtime
+    return {
+        "ok": True,
+        "path": str(p),
+        "pre_mtime": pre_mtime,
+        "post_mtime": post_mtime,
+        "pre_state": {"old_string": old_string, "old_string_len": len(old_string)},
+        "command": f"file-patch {p.name} ({len(old_string)}→{len(new_string)} chars)",
+    }
+
+
+def _cron_exists(cron_id: str) -> bool:
+    """Return False if `openclaw cron show <cron_id> --json` reports the cron is missing."""
+    try:
+        p = subprocess.run([OPENCLAW, "cron", "show", cron_id, "--json"], capture_output=True, text=True, timeout=30)
+        return p.returncode == 0
+    except Exception:
+        return False
+
+
+def _read_cron_fields(cron_id: str, field_names: list[str]) -> dict | None:
+    """Read current cron and extract the named fields (handles nested payload.* / schedule.*)."""
+    try:
+        p = subprocess.run([OPENCLAW, "cron", "show", cron_id, "--json"], capture_output=True, text=True, timeout=30)
+        if p.returncode != 0:
+            return None
+        doc = json.loads(p.stdout)
+    except Exception:
+        return None
+    out: dict = {}
+    payload = doc.get("payload") or {}
+    schedule = doc.get("schedule") or {}
+    for k in field_names:
+        if k == "model":
+            out[k] = payload.get("model")
+        elif k == "cron":
+            out[k] = schedule.get("expr")
+        elif k == "every":
+            out[k] = schedule.get("every")
+        elif k == "agent":
+            out[k] = doc.get("agentId")
+        elif k == "description":
+            out[k] = doc.get("description")
+        else:
+            out[k] = doc.get(k)
+    return out
+
+
+def handler_cron_edit(apply_block: dict, dry_run: bool) -> dict:
+    params = apply_block.get("params") or {}
+    cron_id = params.get("cron_id")
+    changes = params.get("changes") or {}
+    if not cron_id or not changes:
+        return {"ok": False, "reason": "cron-edit missing cron_id or changes"}
+    if not _cron_exists(cron_id):
+        return {"ok": False, "stale_target": True, "reason": f"cron {cron_id} no longer exists (deleted or recreated under new id)"}
+    flag_map = {
+        "model": "--model",
+        "cron": "--cron",
+        "agent": "--agent",
+        "description": "--description",
+        "every": "--every",
+    }
+    cmd = [OPENCLAW, "cron", "edit", cron_id]
+    for k, v in changes.items():
+        flag = flag_map.get(k)
+        if not flag:
+            return {"ok": False, "reason": f"unsupported cron-edit field: {k}"}
+        cmd.extend([flag, str(v)])
+    if dry_run:
+        return {"ok": True, "dry_run": True, "command": " ".join(cmd)}
+
+    # Capture pre-state for incident-undo (only the fields we're about to change).
+    pre_state = _read_cron_fields(cron_id, list(changes.keys()))
+
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    if p.returncode != 0:
+        return {"ok": False, "reason": f"cron edit failed: {p.stderr.strip() or p.stdout.strip()}", "command": " ".join(cmd)}
+    return {
+        "ok": True,
+        "command": " ".join(cmd),
+        "stdout": p.stdout.strip()[:300],
+        "pre_state": {"cron_id": cron_id, "fields": pre_state} if pre_state is not None else None,
+    }
+
+
+def handler_noop(handler: str, apply_block: dict, dry_run: bool) -> dict:
+    return {
+        "ok": True,
+        "noop": True,
+        "handler": handler,
+        "note": (apply_block.get("params") or {}).get("next_step") or (apply_block.get("params") or {}).get("manual_step") or "",
+    }
+
+
+def handler_deferred(handler: str, apply_block: dict, dry_run: bool) -> dict:
+    hints = {
+        "skill-patch": "use handler=file-patch for skill files (~/.openclaw/skills/ is in the file-patch allowlist)",
+    }
+    hint = hints.get(handler, "no implementation yet")
+    return {"ok": False, "deferred": True, "handler": handler, "reason": f"{handler} handler not implemented — {hint}"}
+
+
+# ---------- routing-fix helpers ----------
+
+ROUTING_FIX_ALLOWED_TOP = {"channels", "routing"}
+
+
+def _read_config_value(path: str):
+    """Read a config value via `openclaw config get`. Returns the JSON-parsed value or None."""
+    try:
+        p = subprocess.run([OPENCLAW, "config", "get", path, "--json"], capture_output=True, text=True, timeout=15)
+        if p.returncode != 0:
+            return None
+        out = p.stdout.strip()
+        if not out:
+            return None
+        return json.loads(out)
+    except Exception:
+        return None
+
+
+def _walk_merge_leaves(d: dict, prefix: str = "") -> list[str]:
+    """Walk a merge dict, return dot-paths for each leaf (non-dict) value."""
+    out: list[str] = []
+    for k, v in d.items():
+        path = f"{prefix}.{k}" if prefix else k
+        if isinstance(v, dict):
+            out.extend(_walk_merge_leaves(v, path))
+        else:
+            out.append(path)
+    return out
+
+
+def _config_patch(merge: dict, dry_run: bool = False) -> tuple[bool, str]:
+    """Apply a merge to openclaw.json via `openclaw config patch --file`."""
+    import tempfile
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json5", delete=False) as f:
+        json.dump(merge, f)
+        tmp_path = f.name
+    try:
+        cmd = [OPENCLAW, "config", "patch", "--file", tmp_path]
+        if dry_run:
+            cmd.extend(["--dry-run", "--json"])
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if p.returncode != 0:
+            return False, (p.stderr.strip() or p.stdout.strip())[:500]
+        return True, (p.stdout.strip() or "ok")[:200]
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+
+def handler_routing_fix(apply_block: dict, dry_run: bool) -> dict:
+    params = apply_block.get("params") or {}
+    merge = params.get("merge")
+    if not isinstance(merge, dict) or not merge:
+        return {"ok": False, "reason": "routing-fix missing or empty merge dict"}
+
+    bad_keys = [k for k in merge.keys() if k not in ROUTING_FIX_ALLOWED_TOP]
+    if bad_keys:
+        return {"ok": False, "reason": f"routing-fix merge top-level keys must be in {sorted(ROUTING_FIX_ALLOWED_TOP)}; got disallowed: {bad_keys}"}
+
+    leaf_paths = _walk_merge_leaves(merge)
+    if not leaf_paths:
+        return {"ok": False, "reason": "routing-fix merge has no leaf values to apply"}
+
+    # Capture pre-state for undo.
+    pre_leaves = [{"path": p, "value": _read_config_value(p)} for p in leaf_paths]
+
+    # Validate via dry-run first.
+    ok, msg = _config_patch(merge, dry_run=True)
+    if not ok:
+        return {"ok": False, "reason": f"dry-run validation failed: {msg}"}
+
+    if dry_run:
+        return {"ok": True, "dry_run": True, "merge": merge, "leaf_paths": leaf_paths, "pre_state": {"leaves": pre_leaves}}
+
+    # Real apply.
+    ok, msg = _config_patch(merge, dry_run=False)
+    if not ok:
+        return {"ok": False, "reason": f"config patch failed: {msg}"}
+
+    return {
+        "ok": True,
+        "command": f"config patch ({len(leaf_paths)} leaves under {sorted(set(p.split('.', 1)[0] for p in leaf_paths))})",
+        "leaf_paths": leaf_paths,
+        "pre_state": {"leaves": pre_leaves},
+    }
+
+
+def dispatch(apply_block: dict, dry_run: bool) -> dict:
+    handler = apply_block.get("handler")
+    if handler == "cron-edit":
+        return handler_cron_edit(apply_block, dry_run)
+    if handler == "file-patch":
+        return handler_file_patch(apply_block, dry_run)
+    if handler == "file-archive":
+        return handler_file_archive(apply_block, dry_run)
+    if handler == "routing-fix":
+        return handler_routing_fix(apply_block, dry_run)
+    if handler in ("investigate", "infrastructure"):
+        return handler_noop(handler, apply_block, dry_run)
+    if handler in ("skill-patch",):
+        return handler_deferred(handler, apply_block, dry_run)
+    return {"ok": False, "reason": f"unknown handler: {handler!r}"}
+
+
+# ---------- ack formatting helpers ----------
+
+def shorten(s: str, n: int) -> str:
+    s = (s or "").strip()
+    return s if len(s) <= n else s[: n - 1].rstrip() + "…"
+
+
+def _ack_target_name(fm: dict) -> str:
+    fields = fm.get("fields") if isinstance(fm.get("fields"), dict) else {}
+    return (
+        fields.get("cron_name")
+        or fields.get("path")
+        or fm.get("agent")
+        or fm.get("id", "")[-12:]
+        or "?"
+    )
+
+
+def _ack_delta_line(apply_block: dict, result: dict) -> str:
+    """Build a single-line 'what changed' summary.
+
+    cron-edit: walk params.changes vs result.pre_state.fields → 'model: X → Y, cron: A → B'.
+    file-patch: report path + char delta.
+    routing-fix: list leaf paths touched.
+    Returns '' if no useful delta can be built (caller falls back to command/note)."""
+    handler = apply_block.get("handler")
+    params = apply_block.get("params") or {}
+
+    if handler == "cron-edit":
+        changes = params.get("changes") or {}
+        pre = ((result.get("pre_state") or {}).get("fields")) or {}
+        parts = []
+        for k, new_v in changes.items():
+            old_v = pre.get(k)
+            old_disp = _short_model(old_v) if k == "model" else str(old_v)
+            new_disp = _short_model(new_v) if k == "model" else str(new_v)
+            if old_disp == new_disp:
+                parts.append(f"{k}={new_disp} (no-op)")
+            else:
+                parts.append(f"{k}: {old_disp} → {new_disp}")
+        return ", ".join(parts)
+
+    if handler == "file-patch":
+        path = params.get("path") or ""
+        name = Path(path).name if path else "?"
+        old_n = len(params.get("old_string") or "")
+        new_n = len(params.get("new_string") or "")
+        return f"{name} ({old_n}→{new_n} chars)"
+
+    if handler == "file-archive":
+        path = params.get("path") or ""
+        return f"archived {Path(path).name}"
+
+    if handler == "routing-fix":
+        leaves = result.get("leaf_paths") or []
+        if not leaves:
+            return "routing patched"
+        return f"routing: {leaves[0]}" + (f" (+{len(leaves)-1} more)" if len(leaves) > 1 else "")
+
+    if handler == "corrective-retry":
+        return result.get("summary") or "retry executed"
+
+    return ""
+
+
+def _short_model(v) -> str:
+    """Strip the provider prefix for display: 'ollama/glm-5.1:cloud' → 'glm-5.1'."""
+    if not v:
+        return str(v)
+    s = str(v)
+    if "/" in s:
+        s = s.split("/", 1)[1]
+    if ":" in s:
+        s = s.split(":", 1)[0]
+    return s
+
+
+# ---------- post to Drift ----------
+
+def post_drift(text: str) -> None:
+    # No-op when the chat id is unset, so the harness runs cleanly out of the box.
+    if not DRIFT_CHAT:
+        print("post_drift skip: HARNESS_TG_CHAT_ID unset", file=sys.stderr)
+        return
+    cmd = [
+        OPENCLAW, "message", "send",
+        "--channel", "telegram",
+        "--account", DRIFT_ACCOUNT,
+        "--target", DRIFT_CHAT,
+        "--thread-id", DRIFT_THREAD,
+        "--message", text,
+    ]
+    p = subprocess.run(cmd, capture_output=True, text=True)
+    if p.returncode != 0:
+        print(f"WARN: post failed: {p.stderr}", file=sys.stderr)
+
+
+# ---------- apply pipeline ----------
+
+def apply_incident(path: Path, dry_run: bool, no_post: bool) -> dict:
+    raw = path.read_text()
+    fm, body = parse_frontmatter(raw)
+    status = fm.get("status") or ""
+    if not status.startswith("approved-"):
+        return {"skipped": True, "reason": f"status={status!r}, expected approved-*"}
+    choice = status.split("-", 1)[1]
+
+    opt, apply_block = ensure_apply_block(fm, body, choice)
+
+    # Persist the apply block on the option (so we don't re-plan next time).
+    if not isinstance(opt.get("apply"), dict):
+        opt["apply"] = apply_block
+
+    # Idempotency check
+    already, reason = preflight_already_applied(apply_block)
+    decided_by = fm.get("decided_by") or "user"
+    applied_by = "auto-safe" if decided_by == "auto-safe" else "drift-apply"
+    if already:
+        result = {"ok": True, "already_applied": True, "preflight": reason}
+        applied_by = "out-of-band-detected"
+    else:
+        result = dispatch(apply_block, dry_run)
+        # Handler may detect already-applied defensively (when preflight was missing/incomplete).
+        if result.get("already_applied"):
+            result["ok"] = True
+            applied_by = "out-of-band-detected"
+            reason = result.get("reason") or reason
+
+    if dry_run:
+        return {"dry_run": True, "incident": fm.get("id"), "apply": apply_block, "preflight": reason, "would_run": result}
+
+    # Update incident
+    now = now_iso()
+    if result.get("ok"):
+        new_status = "applied"
+        fm["status"] = new_status
+        fm["applied_at"] = now
+        fm["applied_by"] = applied_by
+    elif result.get("stale_target"):
+        new_status = "obsolete"
+        fm["status"] = new_status
+        fm["obsolete_at"] = now
+        fm["obsolete_reason"] = "target_missing"
+    else:
+        new_status = "apply-failed"
+        fm["status"] = new_status
+        fm["apply_failed_at"] = now
+
+    # Add an Apply log section
+    apply_log = {
+        "ran_at": now,
+        "choice": choice,
+        "handler": apply_block.get("handler"),
+        "preflight": reason,
+        "result": result,
+        "applied_by": applied_by if result.get("ok") else None,
+    }
+    apply_payload = {"plan": apply_block, "log": apply_log}
+    apply_block_md = f"## Apply\n\n```json\n{json.dumps(apply_payload, indent=2)}\n```\n"
+    if "## Apply" in body:
+        body = re.sub(r"## Apply\n.*?(?=\n## |\Z)", lambda _m: apply_block_md.rstrip("\n"), body, count=1, flags=re.DOTALL)
+    else:
+        body = body.rstrip() + "\n\n" + apply_block_md
+
+    path.write_text(f"---\n{dump_yaml(fm)}\n---\n{body}")
+
+    # Post visible ack — terse, lead with the *delta*, not the command line.
+    if not no_post:
+        short_id = (fm.get("id") or "")[-12:]
+        target = _ack_target_name(fm)
+        delta = _ack_delta_line(apply_block, result)  # e.g. "model: glm-5.1 → claude-sonnet-4-6"
+        if result.get("ok") and applied_by == "out-of-band-detected":
+            text = f"✅ {target}: already in place  ·  id …{short_id}"
+        elif result.get("stale_target"):
+            text = f"🗑️ {target}: target missing — incident obsolete  ·  id …{short_id}"
+        elif result.get("ok"):
+            tag = "auto" if applied_by == "auto-safe" else choice
+            if delta:
+                text = f"✅ {target}: {delta}  ·  {tag}  ·  id …{short_id}"
+            else:
+                cmd_run = result.get("command") or result.get("note") or apply_block.get("handler") or "(applied)"
+                text = f"✅ {target}: {shorten(str(cmd_run), 120)}  ·  {tag}  ·  id …{short_id}"
+        else:
+            text = f"❌ {target}: apply failed — {shorten(str(result.get('reason','unknown')), 160)}  ·  id …{short_id}"
+        post_drift(text)
+
+    return {"incident": fm.get("id"), "status": new_status, "result": result, "apply_log": apply_log}
+
+
+# ---------- CLI ----------
+
+def cmd_one(args):
+    path = find_by_id(args.id)
+    if not path:
+        print(f"not found: {args.id}", file=sys.stderr)
+        return 1
+    result = apply_incident(path, dry_run=args.dry_run, no_post=args.no_post)
+    print(json.dumps(result, indent=2))
+    inner = result.get("result") or {}
+    if inner.get("ok") or result.get("dry_run") or result.get("skipped") or inner.get("stale_target"):
+        return 0
+    return 1
+
+
+def cmd_all_approved(args):
+    n_ok = n_skip = n_err = n_obsolete = 0
+    for f in iter_incidents():
+        try:
+            fm, _ = parse_frontmatter(f.read_text())
+        except Exception:
+            continue
+        if not (fm.get("status") or "").startswith("approved-"):
+            continue
+        try:
+            result = apply_incident(f, dry_run=args.dry_run, no_post=args.no_post)
+            inner = result.get("result") or {}
+            if result.get("skipped"):
+                n_skip += 1
+            elif inner.get("ok") or result.get("dry_run"):
+                n_ok += 1
+            elif inner.get("stale_target"):
+                n_obsolete += 1
+            else:
+                n_err += 1
+            if args.verbose:
+                print(json.dumps(result)[:300])
+        except Exception as e:
+            n_err += 1
+            print(f"  ERR {fm.get('id', '?')}: {e}", file=sys.stderr)
+    print(f"applied={n_ok} skipped={n_skip} obsolete={n_obsolete} errors={n_err}")
+    return 0 if n_err == 0 else 1
+
+
+def main():
+    p = argparse.ArgumentParser(prog="incident-apply")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--all-approved", action="store_true")
+    p.add_argument("--no-post", action="store_true", help="skip Drift ack post")
+    p.add_argument("--verbose", "-v", action="store_true")
+    p.add_argument("id", nargs="?")
+    args = p.parse_args()
+    if args.all_approved:
+        return cmd_all_approved(args)
+    if not args.id:
+        p.error("provide an incident id or --all-approved")
+    return cmd_one(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

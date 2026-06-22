@@ -1,0 +1,287 @@
+#!/usr/bin/env python3
+"""openclaw-invariants-check — weekly verification that the defenses in
+postgres-sync-all.sh and claw-sync-all.sh have not been silently stripped
+by a gbrain upgrade, `openclaw doctor --fix`, or similar regeneration.
+
+Each invariant is a fingerprint inside a script. If the fingerprint is
+missing, the defense was stripped and the system is silently degraded
+(dreams leak back in, source drift goes unnoticed, agents stop syncing
+to GitHub, sanitized config goes stale).
+
+Output
+------
+  Silent on PASS. Exit 0.
+  On FAIL: one line per failed invariant + summary, written to
+  ${OPENCLAW_HOME}/logs/invariants.log AND a drift incident under
+  ${OPENCLAW_HOME}/incidents/YYYY-MM-DD/. Exit 1.
+
+Wiring
+------
+  Scheduled by ~/Library/LaunchAgents/ai.openclaw.invariants-check.plist
+  (weekly Sun 05:00, 1h after gbrain backups push).
+  Also runnable manually: `openclaw-invariants-check`.
+
+Environment
+-----------
+  OPENCLAW_HOME   defaults to ~/.openclaw
+  GH_ORG          GitHub org/user that hosts the DR repos (for URL checks)
+  HARNESS_DR_REPO local DR bundle dir name under $HOME (default: agent-harness-dr)
+  AGENTS_MAP      override path to config/agents.map
+
+See: ${OPENCLAW_HOME}/config/README.md (silent-break-risks section).
+"""
+from __future__ import annotations
+
+import datetime as dt
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+HOME = Path.home()
+OPENCLAW_HOME = Path(os.environ.get("OPENCLAW_HOME", os.path.expanduser("~/.openclaw")))
+GH_ORG = os.environ.get("GH_ORG", "")
+DR_REPO = os.environ.get("HARNESS_DR_REPO", "agent-harness-dr")
+
+
+def _load_agents_map():
+    """Return list of (agent_id, workspace_dir, persona) from config/agents.map."""
+    here = Path(__file__).resolve()
+    candidates = []
+    env_map = os.environ.get("AGENTS_MAP")
+    if env_map:
+        candidates.append(Path(env_map))
+    candidates.append(OPENCLAW_HOME / "config" / "agents.map")
+    candidates.append(here.parent.parent.parent / "config" / "agents.map")
+    for c in candidates:
+        try:
+            if c.is_file():
+                rows = []
+                for line in c.read_text(encoding="utf-8").splitlines():
+                    line = line.split("#", 1)[0].strip()
+                    if not line:
+                        continue
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        rows.append((parts[0], parts[1], parts[2]))
+                if rows:
+                    return rows
+        except OSError:
+            continue
+    return [("main", "workspace", "Orchestrator"), ("dev", "workspace-dev", "Developer")]
+
+
+AGENTS = _load_agents_map()
+# tuple list (workspace-dir, persona) used to derive walker + DR fingerprints.
+WORKSPACES = [(ws, persona) for _aid, ws, persona in AGENTS]
+
+SYNC_SH      = HOME / ".gbrain" / "postgres-sync-all.sh"
+WALKER_SH    = OPENCLAW_HOME / "tools" / "claw-sync-all.sh"
+MANIFEST     = OPENCLAW_HOME / "config" / "gbrain-sources.json"
+DR_MANIFEST  = HOME / DR_REPO / "workspaces.manifest.yaml"
+
+DREAMS_PURGE = OPENCLAW_HOME / "skills" / "gbrain-dreams-purge" / "bin" / "run.sh"
+DOCTOR       = OPENCLAW_HOME / "bin" / "invariants" / "gbrain-sources-doctor"
+SANITIZER    = OPENCLAW_HOME / "bin" / "dr" / "openclaw-config-sanitize"
+STATE_SNAP   = OPENCLAW_HOME / "bin" / "dr" / "openclaw-state-snapshot"
+RETRIEVAL_AUDIT = OPENCLAW_HOME / "bin" / "frontmatter" / "openclaw-frontmatter-retrieval-audit"
+
+# DR copy of the walker — without this, the walker is self-referential and
+# would not survive a fresh-machine rebuild from the DR repo alone.
+DR_WALKER    = HOME / DR_REPO / "tools" / "claw-sync-all.sh"
+
+LOG_DIR      = OPENCLAW_HOME / "logs"
+LOG_FILE     = LOG_DIR / "invariants.log"
+INCIDENT_DIR = OPENCLAW_HOME / "incidents"
+
+
+def _build_walker_components() -> list[str]:
+    """Component-line patterns that MUST appear in claw-sync-all.sh's COMPONENTS
+    array — one per non-default workspace (derived from agents.map), plus the
+    fixed shared-skills and DR-repo entries. The default 'workspace' (orchestrator
+    root) is synced as the gbrain default source, not as a walker component."""
+    pats: list[str] = []
+    for ws, _persona in WORKSPACES:
+        if ws == "workspace":
+            continue
+        # tag is the workspace dir minus the 'workspace-' prefix
+        tag = ws.replace("workspace-", "")
+        ws_path = re.escape(f"{OPENCLAW_HOME}/{ws}")
+        pats.append(rf'"{re.escape(tag)}\|{ws_path}\|"')
+    pats.append(rf'"shared-skills\|{re.escape(str(OPENCLAW_HOME / "skills"))}\|"')
+    pats.append(rf'"{re.escape(DR_REPO)}\|{re.escape(str(HOME / DR_REPO))}\|sync_dr_repo_subdirs"')
+    return pats
+
+
+# Components that MUST appear in claw-sync-all.sh's COMPONENTS array.
+WALKER_COMPONENTS = _build_walker_components()
+
+
+def _build_dr_manifest_urls() -> list[str]:
+    """Repo URLs that MUST appear in the DR workspaces manifest. Derived from
+    GH_ORG + a per-agent repo name (workspace dir minus 'workspace-'; the
+    default workspace maps to its persona-derived memory repo). restore-workspaces.sh
+    iterates this manifest; a missing URL means DR rebuild silently skips that
+    component. With GH_ORG unset these collapse to relative repo names."""
+    base = f"https://github.com/{GH_ORG}/" if GH_ORG else ""
+    urls: list[str] = []
+    for ws, persona in WORKSPACES:
+        if ws == "workspace":
+            repo = f"{persona.lower()}-memory"
+        else:
+            repo = ws.replace("workspace-", "")
+        urls.append(f"{base}{repo}.git")
+    urls.append(f"{base}shared-skills.git")
+    urls.append(f"{base}gbrain-backups.git")
+    return urls
+
+
+# Repos that MUST appear in the DR workspaces.manifest.yaml.
+DR_MANIFEST_URLS = _build_dr_manifest_urls()
+
+
+# Hook function definitions that MUST appear in claw-sync-all.sh.
+WALKER_HOOKS = [
+    "sync_gbrain_config()",
+    "sync_openclaw_bin()",
+    "sync_openclaw_tools()",
+    "sync_openclaw_config()",
+    "sync_openclaw_config_dir()",
+    "sync_openclaw_state()",
+    "sync_dr_repo_subdirs()",
+]
+
+
+def check_file_contains(path: Path, patterns: list[tuple[str, str]]) -> list[str]:
+    """Return list of failure messages for missing patterns."""
+    fails = []
+    if not path.exists():
+        return [f"FILE MISSING: {path}"]
+    text = path.read_text()
+    for label, pat in patterns:
+        if not re.search(pat, text):
+            fails.append(f"MISSING: {label} (in {path})")
+    return fails
+
+
+def check_executable(path: Path, label: str) -> list[str]:
+    if not path.exists():
+        return [f"MISSING: {label} ({path})"]
+    if not os.access(path, os.X_OK):
+        return [f"NOT EXECUTABLE: {label} ({path})"]
+    return []
+
+
+def check_retrieval_audit() -> list[str]:
+    """Run the wiki retrieval audit across all configured workspaces. Any FAIL is
+    a regression — the invariant is that the fleet holds at 0 FAIL. Also catches
+    yaml-hazard-unquoted-colon findings, which mark silent gbrain parse failures."""
+    if not RETRIEVAL_AUDIT.exists():
+        return [f"MISSING: retrieval-audit tool ({RETRIEVAL_AUDIT})"]
+    try:
+        res = subprocess.run(
+            [str(RETRIEVAL_AUDIT), "--json"],
+            capture_output=True, text=True, timeout=120,
+        )
+    except Exception as e:
+        return [f"RETRIEVAL AUDIT CRASHED: {e}"]
+    try:
+        data = json.loads(res.stdout)
+    except Exception as e:
+        return [f"RETRIEVAL AUDIT OUTPUT UNPARSEABLE: {e}"]
+    fails = []
+    fail_count = data.get("fail_count", 0)
+    if fail_count > 0:
+        # Show up to 10 worst so the incident is actionable
+        sample = [f for f in data.get("findings", []) if f.get("severity") == "FAIL"][:10]
+        lines = [f"RETRIEVAL AUDIT: {fail_count} FAIL findings (fleet baseline = 0)"]
+        for f in sample:
+            lines.append(f"  · {f['workspace']}/{f['rel_path']} — {f['issue']}")
+        if fail_count > len(sample):
+            lines.append(f"  · …and {fail_count - len(sample)} more")
+        fails.extend(lines)
+    return fails
+
+
+def main() -> int:
+    fails: list[str] = []
+
+    # --- postgres-sync-all.sh: dreams-purge + sources-doctor in tail chain ---
+    fails += check_file_contains(SYNC_SH, [
+        ("dreams-purge call",
+         r"gbrain-dreams-purge/bin/run\.sh"),
+        ("sources-doctor call",
+         r"gbrain-sources-doctor"),
+    ])
+
+    # --- claw-sync-all.sh: one component per configured workspace + fixed entries ---
+    for pat in WALKER_COMPONENTS:
+        fails += check_file_contains(WALKER_SH, [(f"component line matching {pat}", pat)])
+
+    # --- claw-sync-all.sh: hook functions ---
+    for hook in WALKER_HOOKS:
+        fails += check_file_contains(WALKER_SH, [
+            (f"hook function {hook}", re.escape(hook))
+        ])
+
+    # --- supporting bin scripts exist + executable ---
+    fails += check_executable(DREAMS_PURGE, "dreams-purge skill runner")
+    fails += check_executable(DOCTOR,       "gbrain-sources-doctor")
+    fails += check_executable(SANITIZER,    "openclaw-config-sanitize")
+    fails += check_executable(STATE_SNAP,   "openclaw-state-snapshot")
+
+    # --- walker must exist under DR (DR repo tools/claw-sync-all.sh) ---
+    if not DR_WALKER.exists():
+        fails.append(f"MISSING: walker under DR ({DR_WALKER}) — rebuild has no walker")
+
+    # --- manifest exists + parseable ---
+    if not MANIFEST.exists():
+        fails.append(f"MISSING: gbrain-sources.json manifest ({MANIFEST})")
+    else:
+        try:
+            data = json.loads(MANIFEST.read_text())
+            if not data.get("sources"):
+                fails.append("MANIFEST EMPTY: gbrain-sources.json has no 'sources' key")
+        except Exception as e:
+            fails.append(f"MANIFEST UNPARSEABLE: {e}")
+
+    # --- DR workspaces manifest: parseable + all component URLs present ---
+    if not DR_MANIFEST.exists():
+        fails.append(f"MISSING: DR workspaces manifest ({DR_MANIFEST})")
+    else:
+        dr_text = DR_MANIFEST.read_text()
+        for url in DR_MANIFEST_URLS:
+            if url not in dr_text:
+                fails.append(f"DR MANIFEST MISSING URL: {url}")
+
+    # --- Retrieval-audit: wiki/ FAIL count must stay 0 across the fleet ---
+    fails += check_retrieval_audit()
+
+    if not fails:
+        return 0
+
+    # --- Fail path: log + incident file + stderr ---
+    ts = dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    day = dt.datetime.now().strftime("%Y-%m-%d")
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    incident_dir = INCIDENT_DIR / day
+    incident_dir.mkdir(parents=True, exist_ok=True)
+    incident_file = incident_dir / f"invariants-{ts}.txt"
+
+    header = f"[{ts}] INVARIANTS FAILED ({len(fails)} issues)"
+    body = "\n".join(["  - " + f for f in fails])
+
+    with LOG_FILE.open("a") as fh:
+        fh.write(header + "\n" + body + "\n\n")
+    incident_file.write_text(header + "\n" + body + "\n")
+
+    print(header, file=sys.stderr)
+    print(body, file=sys.stderr)
+    print(f"\nIncident: {incident_file}", file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

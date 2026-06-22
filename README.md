@@ -72,6 +72,26 @@ in **[docs/architecture.md](docs/architecture.md)**, organized so the next
 
 ---
 
+## The stack it installs
+
+The harness is provider-agnostic at the interface, but it ships **wired for a
+specific, proven, fully-local stack** — so a fresh install is real storage with
+memory, not a pile of TODOs:
+
+| Tier | Tool | What it does |
+|------|------|--------------|
+| **Graph store** (durable cortex) | **[Gbrain](https://github.com/garrytan/gbrain)** by [Garry Tan](https://github.com/garrytan) | Markdown-first, Postgres-backed knowledge layer that auto-wires a *typed* knowledge graph (`works_at`, `founded`, `attended`, …) over your notes — hybrid vector + BM25 + RRF search, zero LLM calls for graph extraction. |
+| **Vector index** (fast recall) | **[QMD](https://github.com/tobi/qmd)** by [Tobi Lütke](https://github.com/tobi) | On-device search engine — BM25 + vector + local LLM rerank via `node-llama-cpp`, all offline. The low-latency path, queried first. |
+
+`dr/bootstrap.sh` installs both (`@tobilu/qmd` + a Bun-linked `gbrain`), pulls the
+embedding model, and brings the MCP services up. Both sit behind the single
+`memory-retrieve` interface (**QMD first, then Gbrain**), so the skills don't care
+which backend answers — and you can swap either for another vector/graph store
+without touching them. Out of the box, though, it's a complete
+**storage + memory + eval + self-check** install.
+
+---
+
 ## Quick start
 
 **Use it as a template** (the recommended path): click **“Use this template”** on
@@ -168,9 +188,10 @@ Other principles the codebase holds to:
 
 - **Python 3.11+** — `adapt.py` is pure stdlib, no `pip install`.
 - **git** + a GitHub org/owner you can push to.
-- For the full memory stack: a local Postgres (graph store) and a vector-index
-  service. Both are **optional for a first run** — the memory skills degrade
-  gracefully if the backends aren't up yet.
+- For the full memory stack: a local Postgres (for [Gbrain](https://github.com/garrytan/gbrain),
+  the graph store) and [QMD](https://github.com/tobi/qmd) (the vector index) —
+  both installed by `dr/bootstrap.sh`. They're **optional for a first run**; the
+  memory skills degrade gracefully if the backends aren't up yet.
 - The DR `bootstrap.sh` targets **macOS** (Homebrew + LaunchAgents). The memory,
   skills, and self-improvement layers are OS-agnostic.
 
@@ -206,8 +227,25 @@ clearly (†) so the map never over-promises the bundle.
 
 ---
 
+## Acknowledgements
+
+This harness is an operational layer *around* two excellent open-source projects,
+and ships configured to use them out of the box — if you build on it, go star
+theirs:
+
+- **[Gbrain](https://github.com/garrytan/gbrain)** by **[Garry Tan](https://github.com/garrytan)**
+  — the self-wiring, Postgres-backed knowledge graph that serves as the memory
+  store's graph tier (MIT).
+- **[QMD](https://github.com/tobi/qmd)** by **[Tobi Lütke](https://github.com/tobi)**
+  — the fast, fully-local markdown search engine that serves as the vector
+  recall tier.
+
+The layered-memory, drift-loop, and disaster-recovery patterns here are the
+harness; Gbrain and QMD are the storage and recall it's wired to.
+
+---
+
 ## License
 
-MIT — see [LICENSE](LICENSE). Copyright is held by "agent-harness contributors";
-contributions welcome under the same terms.
+MIT — see [LICENSE](LICENSE). Contributions welcome under the same terms.
 ```

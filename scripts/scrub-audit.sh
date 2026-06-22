@@ -36,10 +36,19 @@ PATTERNS=(
 # everywhere. Only .git is excluded from the whole scan.
 EXCLUDE='--exclude-dir=.git --exclude-dir=node_modules --exclude-dir=__pycache__'
 
+# The author GitHub handle is banned everywhere as an accidental-leak guard, with
+# ONE deliberate exception: intentional author credit in the LICENSE file. It must
+# still never appear anywhere else (URLs use the ${GH_ORG} placeholder).
+AUTHOR_HANDLE='Walliiee'
+
 fail=0
 for pat in "${PATTERNS[@]}"; do
   # shellcheck disable=SC2086
   hits=$(grep -rInE $EXCLUDE -- "$pat" . 2>/dev/null | grep -vF 'scripts/scrub-audit.sh')
+  # Allow the author handle in LICENSE only (intentional copyright credit).
+  if [ "$pat" = "$AUTHOR_HANDLE" ] && [ -n "$hits" ]; then
+    hits=$(printf '%s\n' "$hits" | grep -vE '^\./LICENSE:' || true)
+  fi
   if [ -n "$hits" ]; then
     echo "✗ LEAK — pattern '$pat':"
     echo "$hits" | sed 's/^/    /'

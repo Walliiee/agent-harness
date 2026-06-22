@@ -87,8 +87,14 @@ direct lever on the cross-contamination failure from Layer 1.
 |------|-----------|----------|------------|
 | **Daily memory** | 7-day capture window, hippocampus | `workspace*/memory/YYYY-MM-DD.md` | `memory-capture` skill at session-cleanup |
 | **Wiki** | Durable cortex, canonical pages | `workspace*/wiki/{concepts,projects,people,...}/*.md` | `wiki-write` skill (†, see Layer 4) + `memory-promote` |
-| **Graph store** | Structured pages + graph + timeline (Postgres + pgvector) | config under `${OPENCLAW_HOME}`; DB on `localhost:5432`; MCP on a local port | hourly sync job |
-| **Vector index** | Fast vector recall, per-agent indices + a hub view | `${OPENCLAW_HOME}/agents/<id>/qmd/`; MCP on a local port | sync job (every ~30 min) |
+| **Graph store** ([Gbrain](https://github.com/garrytan/gbrain)) | Structured pages + typed graph + timeline (Postgres + pgvector) | config under `${OPENCLAW_HOME}`; DB on `localhost:5432`; MCP on a local port | hourly sync job |
+| **Vector index** ([QMD](https://github.com/tobi/qmd)) | Fast local vector recall, per-agent indices + a hub view | `${OPENCLAW_HOME}/agents/<id>/qmd/`; MCP on a local port | sync job (every ~30 min) |
+
+The harness ships wired to **[Gbrain](https://github.com/garrytan/gbrain)** (Garry
+Tan) for the graph tier and **[QMD](https://github.com/tobi/qmd)** (Tobi Lütke) for
+the vector tier — both fully local, both installed by `dr/bootstrap.sh`. They sit
+behind the `memory-retrieve` interface, so either can be swapped for another
+graph/vector backend without touching the skills above.
 
 **Embedding alignment:** both the graph store and the vector index must embed
 with the **same model and dimensionality**. Different embedding spaces silently

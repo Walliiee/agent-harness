@@ -86,7 +86,7 @@ direct lever on the cross-contamination failure from Layer 1.
 | Tier | What it is | Lives at | Updated by |
 |------|-----------|----------|------------|
 | **Daily memory** | 7-day capture window, hippocampus | `workspace*/memory/YYYY-MM-DD.md` | `memory-capture` skill at session-cleanup |
-| **Wiki** | Durable cortex, canonical pages | `workspace*/wiki/{concepts,projects,people,...}/*.md` | `wiki-write` skill + `memory-promote` |
+| **Wiki** | Durable cortex, canonical pages | `workspace*/wiki/{concepts,projects,people,...}/*.md` | `wiki-write` skill (†, see Layer 4) + `memory-promote` |
 | **Graph store** | Structured pages + graph + timeline (Postgres + pgvector) | config under `${OPENCLAW_HOME}`; DB on `localhost:5432`; MCP on a local port | hourly sync job |
 | **Vector index** | Fast vector recall, per-agent indices + a hub view | `${OPENCLAW_HOME}/agents/<id>/qmd/`; MCP on a local port | sync job (every ~30 min) |
 
@@ -126,17 +126,25 @@ A **skill** is a self-contained `SKILL.md` plus an optional `bin/` runner.
 `skills/` (pushed as its own repo); per-agent skills under `workspace*/skills/`
 shadow the shared ones.
 
-| Skill | Purpose |
-|-------|---------|
-| `memory-capture` | Capture decisions/outcomes into daily memory (sole daily-memory writer) |
-| `memory-promote` / `memory-compact` | Promote 7-day captures → wiki; word-cap daily files |
-| `wiki-write` | Authoritative wiki-entry writer (structural + retrieval audit gates) |
-| `session-cleanup` | Per-agent nightly close-out (write daily, reconcile tasks, sync, commit) |
-| `morning-standup` / `evening-standup` / `brief` | Trigger-driven (start of day, shutdown, meeting prep) |
-| `drift-watcher` / `drift-learn` / `drift-ack` | Drift incident loop (Layer 6c) |
-| `freshness-watch` / `memory-bloat-audit` / `memory-capture-audit` | Self-improving watchers (Layer 6a) |
-| `model-bakeoff` | Cross-model capability eval + weekly regression gate (Layer 6b) |
-| `qmd-sync` / `wiki-lint` | Index sync; closed-graph link integrity |
+The table below maps the *roles* in the design. The **`skills/` directory is the
+source of truth** for what actually ships — `ls skills/` is the canonical list.
+Rows marked **†** describe a role in the broader live system that is **not in the
+OSS bundle**: it's either site-specific (your gateway wiring) or a harness you
+author yourself. The harness still ships the *gates* those roles depend on (e.g.
+the frontmatter retrieval audit that a `wiki-write` skill would call).
+
+| Skill | Purpose | Bundled |
+|-------|---------|:-------:|
+| `memory-capture` | Capture decisions/outcomes into daily memory (sole daily-memory writer) | ✓ |
+| `memory-promote` / `memory-compact` | Promote 7-day captures → wiki; word-cap daily files | ✓ |
+| `memory-retrieve` | Single retrieval entry point (vector index → graph store) | ✓ |
+| `wiki-write` † | Authoritative wiki-entry writer (structural + retrieval audit gates) | — |
+| `session-cleanup` † | Per-agent nightly close-out (write daily, reconcile tasks, sync, commit) | — |
+| `morning-standup` / `evening-standup` / `brief` † | Trigger-driven (start of day, shutdown, meeting prep) | — |
+| `drift-watcher` / `drift-learn` / `drift-ack` | Drift incident loop (Layer 6c) | ✓ |
+| `freshness-watch` / `memory-bloat-audit` / `memory-capture-audit` | Self-improving watchers (Layer 6a) | ✓ |
+| `model-bakeoff` † | Cross-model capability eval + weekly regression gate (Layer 6b) | — |
+| `qmd-sync` / `wiki-lint` | Index sync; closed-graph link integrity | ✓ |
 
 **Pattern rule:** *cron is a thin trigger; the skill does the work.* No business
 logic in scheduler payloads — a payload is a one-line prompt that invokes a
@@ -209,6 +217,10 @@ watchers that feed it.
   eval is the canary.
 
 ### 6b. Model bakeoff — which model for what
+
+*(The bakeoff harness is a role you author yourself — † in Layer 4, not in the
+OSS bundle. The pattern is documented here because the routing in Layer 1 leans
+on it.)*
 
 - **Matrix:** a capability matrix of axes × models, scored cell by cell.
 - **Regression gate:** diffs current verdicts against a baseline snapshot and

@@ -21,8 +21,8 @@ pass; you can walk away during it.
 Two environment variables drive the templated paths and URLs:
 
 ```sh
-export OPENCLAW_HOME="$HOME"        # install root (defaults to $HOME)
-export GH_ORG="<your-github-org>"   # org/user that owns your workspace repos
+export OPENCLAW_HOME="$HOME/.openclaw"   # install root (defaults to $HOME/.openclaw)
+export GH_ORG="<your-github-org>"        # org/user that owns your workspace repos
 ```
 
 ---

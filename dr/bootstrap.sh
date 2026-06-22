@@ -15,7 +15,23 @@
 
 set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# ----- args -----
+#   --home PATH    set OPENCLAW_HOME (wins over the $OPENCLAW_HOME env var)
+#   --agents LIST  accepted for CLI symmetry with adapt.py / the docs, but a
+#                  no-op here: bootstrap derives its component set from the
+#                  workspaces manifest, not from an agent list.
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --home)     OPENCLAW_HOME="${2:?--home needs a path}"; shift 2 ;;
+    --home=*)   OPENCLAW_HOME="${1#*=}"; shift ;;
+    --agents)   shift 2 ;;
+    --agents=*) shift ;;
+    *)          shift ;;
+  esac
+done
 : "${OPENCLAW_HOME:=$HOME/.openclaw}"
+OPENCLAW_HOME="${OPENCLAW_HOME/#\~/$HOME}"
 # The repo ships templates; restore-workspaces uses the .template manifest.
 MANIFEST="$SCRIPT_DIR/workspaces.manifest.yaml.template"
 

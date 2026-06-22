@@ -109,9 +109,14 @@ After `adapt.py --apply` has written your config:
 # Render + load the system daemons (macOS LaunchAgents):
 bash launchd/install-launchagents.sh --home ~/.openclaw
 
-# (On a fresh-machine rebuild, the DR bootstrap does this for you:)
-./dr/bootstrap.sh --home ~/.openclaw --agents config/agents.map
+# (On a fresh-machine rebuild, the DR bootstrap installs the daemons for you
+#  as one of its steps — see docs/disaster-recovery.md:)
+./dr/bootstrap.sh --home ~/.openclaw
 ```
+
+Both scripts take `--home` (or read `OPENCLAW_HOME` from the env). `bootstrap.sh`
+derives its component set from `dr/workspaces.manifest.yaml`, so it doesn't take
+an agent list — your roster comes from `adapt.py` / `agents.map`.
 
 The agent-facing crons (Layer 5a) are installed by your gateway from the rendered
 config; the system daemons (Layer 5b) come from `launchd/`.
@@ -138,8 +143,9 @@ You can also spot-check the live system:
 
 - **Invariants:** run the weekly invariants check by hand once — it names every
   defense fingerprint and fails loudly if one is missing.
-- **Retrieval:** write one wiki page via the `wiki-write` skill, then query it
-  back through `memory-retrieve` (vector index first, then graph store).
+- **Retrieval:** capture a fact with the `memory-capture` skill, promote it with
+  `memory-promote`, then query it back through `memory-retrieve` (vector index
+  first, then graph store). All three are in the bundled `skills/` set.
 
 ---
 

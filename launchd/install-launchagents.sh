@@ -4,12 +4,13 @@
 # plist and reloads only the ones whose content changed.
 #
 # Usage:
-#   ./install-launchagents.sh            # render + (re)load
-#   ./install-launchagents.sh --dry-run  # print what would happen, write nothing
+#   ./install-launchagents.sh                  # render + (re)load
+#   ./install-launchagents.sh --dry-run        # print what would happen, write nothing
+#   ./install-launchagents.sh --home ~/.openclaw   # set the install dir explicitly
 #
 # Env:
 #   OPENCLAW_HOME   the .openclaw install dir for path expansion
-#                   (default: $HOME/.openclaw)
+#                   (default: $HOME/.openclaw; --home overrides it)
 
 set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -18,8 +19,19 @@ TEMPLATE="$SCRIPT_DIR/plist.template"
 LA_DIR="$HOME/Library/LaunchAgents"
 : "${OPENCLAW_HOME:=$HOME/.openclaw}"
 
+# ----- args -----
+#   --dry-run     render only; write nothing, load nothing
+#   --home PATH   set OPENCLAW_HOME (wins over the $OPENCLAW_HOME env var)
 DRY_RUN=0
-[[ "${1:-}" == "--dry-run" ]] && DRY_RUN=1
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run)  DRY_RUN=1; shift ;;
+    --home)     OPENCLAW_HOME="${2:?--home needs a path}"; shift 2 ;;
+    --home=*)   OPENCLAW_HOME="${1#*=}"; shift ;;
+    *)          shift ;;
+  esac
+done
+OPENCLAW_HOME="${OPENCLAW_HOME/#\~/$HOME}"
 
 c_blue=$'\033[34m'; c_green=$'\033[32m'; c_yellow=$'\033[33m'; c_red=$'\033[31m'; c_reset=$'\033[0m'
 step() { printf '\n%s==>%s %s\n' "$c_blue" "$c_reset" "$*"; }

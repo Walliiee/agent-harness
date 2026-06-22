@@ -1,8 +1,10 @@
 # Example: two-agent setup (`main` + `dev`)
 
-The minimal working harness: one orchestrator and one developer agent. This is
-exactly what `scripts/adapt.py` produces for the default roster, shown here so
-you can see the shape of the result before running anything.
+The minimal working harness: one orchestrator and one developer agent. This
+mirrors what `scripts/adapt.py` produces for the default roster (the generated
+file uses tab-separated columns and a generated header — equivalent, since every
+reader uses `split()`), shown here so you can see the shape before running
+anything.
 
 ## The roster
 

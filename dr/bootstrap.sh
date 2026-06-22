@@ -25,7 +25,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --home)     OPENCLAW_HOME="${2:?--home needs a path}"; shift 2 ;;
     --home=*)   OPENCLAW_HOME="${1#*=}"; shift ;;
-    --agents)   shift 2 ;;
+    --agents)   shift; [[ $# -gt 0 && "$1" != --* ]] && shift ;;   # no-op; swallow optional value safely
     --agents=*) shift ;;
     *)          shift ;;
   esac
@@ -375,7 +375,8 @@ Bootstrap complete. Remaining manual work:
   3. Restore gbrain database:
      $SCRIPT_DIR/restore-gbrain.sh
 
-  4. Refresh gbrain auth tokens:
+  4. Refresh gbrain auth tokens (site-specific, not bundled — supply your own;
+     skip if your gbrain runs without auth):
      ~/.openclaw/bin/gbrain-token-refresh.sh
 
   5. Rebuild QMD index (~30 min, downloads model weights):

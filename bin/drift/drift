@@ -11,10 +11,11 @@
 set -euo pipefail
 
 OPENCLAW_HOME="${OPENCLAW_HOME:-$HOME/.openclaw}"
-# incident* live in the drift cluster alongside this script.
-INCIDENT_CLI="${INCIDENT_CLI:-$OPENCLAW_HOME/bin/drift/incident}"
-ANALYZE_CLI="${ANALYZE_CLI:-$OPENCLAW_HOME/bin/drift/incident-analyze}"
-NOTIFY_CLI="${NOTIFY_CLI:-$OPENCLAW_HOME/bin/drift/incident-notify}"
+# incident* are deployed flat into ${OPENCLAW_HOME}/bin/ (bootstrap flattens the
+# repo's bin/<category>/ tree); override via env if you keep a grouped layout.
+INCIDENT_CLI="${INCIDENT_CLI:-$OPENCLAW_HOME/bin/incident}"
+ANALYZE_CLI="${ANALYZE_CLI:-$OPENCLAW_HOME/bin/incident-analyze}"
+NOTIFY_CLI="${NOTIFY_CLI:-$OPENCLAW_HOME/bin/incident-notify}"
 
 cmd="${1:-}"
 shift || true

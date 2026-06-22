@@ -179,7 +179,7 @@ only as long as each link survives. Known ways they get silently broken:
   `+x`.
 - This manifest gets deleted or its top-level `sources` key removed.
 - Someone edits the manifest to silence a drift instead of investigating.
-- `dr/workspaces.manifest.yaml` is rewritten with stale paths → the
+- `dr/workspaces.manifest.yaml.template` is rewritten with stale paths → the
   restore script silently skips whichever component URL disappeared.
 - A wiki page is committed with a `description` shorter than 30 chars,
   missing entirely, or carrying an unquoted `:` in its value (silent

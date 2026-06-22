@@ -115,7 +115,7 @@ bash launchd/install-launchagents.sh --home ~/.openclaw
 ```
 
 Both scripts take `--home` (or read `OPENCLAW_HOME` from the env). `bootstrap.sh`
-derives its component set from `dr/workspaces.manifest.yaml`, so it doesn't take
+derives its component set from `dr/workspaces.manifest.yaml.template`, so it doesn't take
 an agent list — your roster comes from `adapt.py` / `agents.map`.
 
 The agent-facing crons (Layer 5a) are installed by your gateway from the rendered

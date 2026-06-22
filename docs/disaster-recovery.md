@@ -119,6 +119,12 @@ The second command does Dynamic Client Registration with gbrain, mints
 per-agent tokens, and patches them into `openclaw.json`. This resolves the
 `${GBRAIN_TOKEN_*}` placeholders.
 
+> **Note:** `gbrain-token-refresh.sh` is **site-specific and not bundled** — it
+> talks to *your* gbrain instance's OAuth/`/register` endpoint, so you supply it
+> (see [gbrain's auth docs](https://github.com/garrytan/gbrain)). If your gbrain
+> runs without auth (the common local-only default), you can skip this step and
+> leave the `${GBRAIN_TOKEN_*}` placeholders empty.
+
 ### Step 5 — Rebuild QMD index
 
 ```sh

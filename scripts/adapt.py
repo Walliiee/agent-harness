@@ -107,7 +107,13 @@ def parse_agents(args, probed: dict) -> list[tuple[str, str, str]]:
         raw = "main,dev"
     rows = []
     label_default = {"main": "Orchestrator", "dev": "Developer"}
+    valid_id = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
     for aid in [a.strip() for a in raw.split(",") if a.strip()]:
+        if not valid_id.match(aid):
+            print(f"warning: skipping invalid agent id {aid!r} — ids must match "
+                  r"[a-z0-9][a-z0-9_-]* (lowercase, no spaces/path separators)",
+                  file=sys.stderr)
+            continue
         ws = "workspace" if aid == "main" else f"workspace-{aid}"
         rows.append((aid, ws, label_default.get(aid, aid.capitalize())))
     return rows
@@ -223,9 +229,11 @@ def validate(out_dir: Path, rendered: list[str], vars: dict | None = None) -> li
         for rex in leak_res:
             for m in rex.finditer(text):
                 hit = m.group(0)
-                # A /Users/... path that is exactly (a prefix of) the configured
-                # home is intentional; anything else is a foreign path leak.
-                if any(hit == p or p.startswith(hit + "/") or hit.startswith(p) for p in allowed_paths):
+                # A /Users/... path that is exactly the configured home, a child
+                # of it, or a parent of it is intentional; anything else is a
+                # foreign path leak. Boundaries are on "/" so e.g. /Users/bobby
+                # does NOT count as a child of home /Users/bob.
+                if any(hit == p or hit.startswith(p + "/") or p.startswith(hit + "/") for p in allowed_paths):
                     continue
                 problems.append(f"possible leak '{hit}' in {rel}")
     # De-dup while keeping order.

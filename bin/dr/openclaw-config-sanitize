@@ -39,7 +39,7 @@ SECRET_KEY_PATTERNS = [
     re.compile(r".*PASSPHRASE.*", re.I),
     re.compile(r".*CREDENTIAL.*", re.I),
     re.compile(r".*PRIVATE_?KEY.*", re.I),
-    re.compile(r"^Authorization$"),
+    re.compile(r".*AUTHORIZATION.*", re.I),   # Authorization, authorization, Proxy-Authorization, …
 ]
 
 # Values that are safe to keep verbatim even under a secret-shaped key.
@@ -55,8 +55,10 @@ EMAIL_RE = re.compile(r"([\w._%+-]+)@([\w.-]+\.\w+)")
 
 
 def is_safe_value(v: str) -> bool:
-    if len(v) < 12:
-        return True
+    # No length shortcut: a SHORT value under a secret-shaped key (a PIN, a short
+    # bearer token, a 9-char API secret) must still be redacted. Only values that
+    # match an explicit safe pattern (path / url / ${VAR} binding / bool / sentinel)
+    # are kept verbatim.
     return any(p.search(v) for p in SAFE_VALUE_PATTERNS)
 
 

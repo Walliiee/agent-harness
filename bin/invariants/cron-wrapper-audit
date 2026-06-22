@@ -145,7 +145,7 @@ if [ ${#violations[@]} -gt 0 ] && [ "$EMIT_INCIDENT" -eq 1 ] && [ "$DRY_RUN" -eq
     echo "Fix: wrap ProgramArguments through \`skill-wrapper --skill <name> --agent <agent> --trigger cron -- <original>\`, OR add a justified entry to the documented-exceptions list."
   } > "$raw"
 
-  "$OPENCLAW_HOME/bin/drift/incident" emit \
+  "$OPENCLAW_HOME/bin/incident" emit \
     --source "cron-wrapper-audit" \
     --type "cron-bypass" \
     --severity "med" \

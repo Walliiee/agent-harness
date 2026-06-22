@@ -96,9 +96,12 @@ the vector tier — both fully local, both installed by `dr/bootstrap.sh`. They 
 behind the `memory-retrieve` interface, so either can be swapped for another
 graph/vector backend without touching the skills above.
 
-**Embedding alignment:** both the graph store and the vector index must embed
-with the **same model and dimensionality**. Different embedding spaces silently
-break cross-source retrieval — lock the stack to one embedding model.
+**Embedding alignment:** within any single index, all content must embed with the
+**same model and dimensionality** — mixing embedding spaces silently breaks
+similarity search inside that store. The shipped stack queries QMD and Gbrain
+*separately* (QMD first, then Gbrain), so the two may use different embedders
+(Gbrain via `bge-m3`; QMD via its own local GGUF model). You only need to align
+them to each other if you ever merge their vectors into one shared space.
 
 **Retrieval order rule:** query the **vector index first** (fast similarity),
 then the **graph store** (structured pages + relationships). A single

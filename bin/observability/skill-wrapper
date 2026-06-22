@@ -21,7 +21,7 @@
 set -uo pipefail
 
 OPENCLAW_HOME="${OPENCLAW_HOME:-$HOME/.openclaw}"
-SKILL_RUN_CLI="${OPENCLAW_SKILL_RUN_CLI:-$OPENCLAW_HOME/bin/observability/skill-run}"
+SKILL_RUN_CLI="${OPENCLAW_SKILL_RUN_CLI:-$OPENCLAW_HOME/bin/skill-run}"
 SUCCESS_CHECKS_ENV="$OPENCLAW_HOME/skill-runs/success-checks.env"
 RECOVERY_MARKERS_FILE="$OPENCLAW_HOME/skill-runs/recovery-markers.txt"
 ERROR_MARKERS_FILE="$OPENCLAW_HOME/skill-runs/error-markers.txt"

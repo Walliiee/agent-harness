@@ -6,7 +6,10 @@ secrets.json
 *.local.json
 .env
 .env.*
-openclaw.json            # real config; only openclaw.json.template is tracked
+# real config; only openclaw.json.template is tracked
+openclaw.json
+# your real leak-gate literals; only .scrub-denylist.example is tracked
+scripts/.scrub-denylist
 
 # Live state (hippocampus / runtime)
 memory/

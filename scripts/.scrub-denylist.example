@@ -1,0 +1,30 @@
+# scrub-audit local denylist — YOUR real identifiers, never committed.
+#
+# Copy this file to scripts/.scrub-denylist (which is gitignored) and replace the
+# placeholders with your real values. scrub-audit.sh reads it and fails the build
+# if any of these appear in a tracked file. Because the file is gitignored, your
+# real values never enter git history.
+#
+# Format: one `grep -E` pattern per line. Blank lines and #-comments are ignored.
+# Add "  @allow=<grep-pattern>" to the end of a line to whitelist matches whose
+# "path:line" location matches that pattern — e.g. an intentional credit you DO
+# want in LICENSE but nowhere else.
+#
+# Examples (replace with your own — these are illustrative placeholders):
+
+# Absolute home path of your machine (URLs/paths should use ${OPENCLAW_HOME}).
+/Users/YOURNAME
+
+# Your GitHub org / handle — allowed only as the copyright credit in LICENSE.
+YourHandle  @allow=^\./LICENSE:
+
+# Your personal domain / contact.
+yourdomain\.tld
+
+# Chat / channel numeric IDs (messaging owner, groups, topics).
+0000000000
+-1000000000000
+
+# Agent persona names that should be generic roles in the public cut.
+\bAgentOne\b
+\bAgentTwo\b

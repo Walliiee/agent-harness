@@ -163,8 +163,11 @@ guards the guards.* A future `doctor --fix` or tool upgrade can't silently
 strip your hardening without the check screaming.
 
 **2. No secrets, ever — enforced, not promised.** `scrub-audit.sh` greps every
-tracked file for absolute home paths, secret-shaped values, and author
-identifiers, and fails CI if it finds one. On the live side, a config sanitizer
+tracked file for secret-shaped values and fails CI if it finds one. Your own
+identifiers (home path, handle, domain, persona names) live in a gitignored
+local denylist (`scripts/.scrub-denylist`, from the tracked `.example`), so the
+gate can catch them on your machine without the list of literals itself ever
+shipping. On the live side, a config sanitizer
 redacts anything whose key contains `token`, `secret`, `api_key`, `password`,
 `credential`, or `authorization` (as substrings — bare `token` included) before
 config is ever pushed to a DR repo. Templates keep their `${VAR}` bindings;

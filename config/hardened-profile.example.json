@@ -1,0 +1,31 @@
+{
+  "_README": "OPT-IN hardening overrides — NOT a full config and NOT the default. These keys REPLACE the matching keys inside a single agent's block in openclaw.json (agents.list[].tools and agents.list[].skills). The shipped default is intentionally permissive (built for a single-user local machine); apply these per agent to scope an agent down for a shared or less-trusted host. Every value here already appears as a valid value in config/openclaw.json.template. Full rationale + a per-agent before/after: docs/hardening.md.",
+
+  "tools": {
+    "fs": {
+      "workspaceOnly": true
+    },
+    "exec": {
+      "security": "deny",
+      "ask": "off",
+      "applyPatch": {
+        "workspaceOnly": true
+      }
+    },
+    "alsoAllow": [
+      "sessions_list",
+      "sessions_send",
+      "sessions_yield"
+    ]
+  },
+
+  "skills": [
+    "memory-capture",
+    "memory-retrieve",
+    "memory-promote",
+    "qmd",
+    "wiki-write",
+    "frontmatter-guard",
+    "drift-ack"
+  ]
+}

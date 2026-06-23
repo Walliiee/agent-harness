@@ -150,7 +150,7 @@ Full walkthrough: **[docs/getting-started.md](docs/getting-started.md)**.
 |------|------------|
 | `bin/` | The harness scripts, grouped by job: `memory/`, `drift/`, `freshness/`, `frontmatter/`, `invariants/`, `index/`, `observability/`, `dr/`. |
 | `skills/` | The bundled agent skills (`SKILL.md` + optional `bin/`) — memory-capture, memory-promote, drift loop, wiki-lint, qmd-sync, and more. `ls skills/` is the canonical list. |
-| `config/` | Templates: `openclaw.json.template`, `agents.map.template`, `gbrain-sources.json.template`, plus a `config-README.md`. |
+| `config/` | Templates: `openclaw.json.template`, `agents.map.template`, `gbrain-sources.json.template`, the opt-in `hardened-profile.example.json`, plus a `config-README.md`. |
 | `launchd/` | One `plist.template` + `jobs.yaml` + an installer that renders every scheduler — no hardcoded paths. |
 | `dr/` | `bootstrap.sh` + `restore-*.sh`, `workspaces.manifest.yaml.template`, `smoke-test.sh`, `secrets/README.md`. |
 | `docs/` | `architecture.md` (the full design), `getting-started.md`, `disaster-recovery.md`. |
@@ -265,10 +265,15 @@ real trust boundary, so install it deliberately:
   secret-shaped keys before any DR push. Real values live only in your gitignored
   `openclaw.json`.
 - **Full filesystem/exec access is the current default,** because the harness is
-  built for a single-user local machine. Adapting it for a shared or less-trusted
-  host means scoping down the per-agent skill allowlists (`config/agents.map` +
-  per-agent configs) first. A locked-down default profile is a roadmap item, not
-  today's default — so this is an opt-in-to-broad-trust tool, by design.
+  built for a single-user local machine. For a shared or less-trusted host, scope
+  the agent down with the **opt-in hardened profile** — copy the overrides from
+  [`config/hardened-profile.example.json`](config/hardened-profile.example.json)
+  into the agent's block (narrowed fs + `exec: "deny"` + a minimal skills
+  allowlist). The walkthrough, including why `exec: "deny"` doesn't break the
+  memory loop, is in **[docs/hardening.md](docs/hardening.md)**. Flipping the
+  *shipped default* to locked-down is a deliberate non-goal — it would break the
+  single-user local case the harness is built for — so broad trust stays opt-in
+  and hardening stays explicit.
 
 ---
 
@@ -298,6 +303,8 @@ clearly (†) so the map never over-promises the bundle.
   install → verify.
 - **[docs/disaster-recovery.md](docs/disaster-recovery.md)** — fresh-machine
   rebuild runbook.
+- **[docs/hardening.md](docs/hardening.md)** — opt-in profile to scope an agent
+  down for a shared or less-trusted host.
 - **[examples/two-agent/](examples/two-agent/)** — the minimal worked example.
 
 ---

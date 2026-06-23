@@ -252,3 +252,41 @@ After Step 7's `smoke-test.sh` reports `FAIL=0`, sanity check the full loop:
 4. `openclaw cron list` — expect your cron jobs.
 
 If all four work, the stack is fully restored.
+
+---
+
+## Uninstall / teardown
+
+`bootstrap.sh` makes three kinds of change. Reverse them in this order. **Back up
+first** — `${OPENCLAW_HOME}` holds your workspaces, memory, and gbrain data.
+
+**1. Unload + remove the LaunchAgents** (derives the labels from `jobs.yaml`):
+
+```bash
+OPENCLAW_HOME="${OPENCLAW_HOME:-$HOME/.openclaw}"
+python3 - launchd/jobs.yaml <<'PY' | while read -r label; do
+  launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || launchctl unload "$HOME/Library/LaunchAgents/$label.plist" 2>/dev/null
+  rm -f "$HOME/Library/LaunchAgents/$label.plist"
+  echo "removed $label"
+done
+import sys, yaml
+for j in (yaml.safe_load(open(sys.argv[1])) or {}).get('jobs') or []:
+    print(j['label'])
+PY
+```
+
+**2. Undo the `~/.zshrc` edits** — bootstrap appends two blocks: a `# Bun` PATH
+line and a `# QMD` alias. Delete those two blocks by hand (open `~/.zshrc`), then
+open a new terminal.
+
+**3. Remove installed packages + data (optional, deliberate):**
+
+- Homebrew packages, `bun`, `qmd`, and `gbrain` were installed globally — remove
+  only if nothing else uses them (`brew uninstall <pkg>`, etc.).
+- The Postgres `gbrain` database: `dropdb gbrain` (this is real data — be sure).
+- `${OPENCLAW_HOME}` itself: delete **only after** backing up workspaces + memory.
+  Your workspace git remotes are the durable copy; the gbrain DB is not unless you
+  have a recent `pg-backup`.
+
+There is no single uninstall script by design — teardown touches global packages
+and irreplaceable data, so each step is deliberate.

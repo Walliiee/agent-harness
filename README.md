@@ -94,6 +94,12 @@ without touching them. Out of the box, though, it's a complete
 
 ## Quick start
 
+> **This is a template repository — not a packaged plugin (yet).** There is no
+> one-command plugin installer; you clone (or **“Use this template”**) and run
+> `adapt.py` to fit it to your machine. A Claude Code plugin / `npx` wrapper is on
+> the [roadmap](#status--roadmap). Platform support varies — the full live stack is
+> macOS-oriented; see [Platform support](#platform-support).
+
 **Use it as a template** (the recommended path): click **“Use this template”** on
 the repo, or clone it:
 
@@ -114,6 +120,9 @@ or Codex and say:
 safe dry-run that writes nothing:
 
 ```bash
+# 0. Check this machine: deps, repo structure, an adapt.py dry-run (writes nothing)
+bash scripts/preflight.sh
+
 # 1. Dry-run: probe your machine, render the templates, validate, print a diff
 python3 scripts/adapt.py --home ~/.openclaw --gh-org my-org --agents main,dev
 
@@ -121,10 +130,10 @@ python3 scripts/adapt.py --home ~/.openclaw --gh-org my-org --agents main,dev
 python3 scripts/adapt.py --home ~/.openclaw --gh-org my-org --agents main,dev \
   --apply --out ~/.openclaw
 
-# 3. Install the schedulers, then verify
-bash launchd/install-launchagents.sh --home ~/.openclaw
-bash dr/smoke-test.sh        # DR wiring intact
-bash scripts/scrub-audit.sh  # nothing personal leaked
+# 3. Install the schedulers (macOS), then verify
+bash launchd/install-launchagents.sh --home ~/.openclaw   # macOS LaunchAgents
+bash scripts/scrub-audit.sh  # nothing personal leaked (also runs in CI)
+bash dr/smoke-test.sh        # live-stack health — only meaningful AFTER full bootstrap
 ```
 
 `adapt.py` **probes** your target (config files, agent names, workspace paths),
@@ -189,14 +198,56 @@ Other principles the codebase holds to:
 
 ## Requirements
 
-- **Python 3.11+** — `adapt.py` is pure stdlib, no `pip install`.
+- **Python 3.9+** — `adapt.py` is pure stdlib, no `pip install`.
 - **git** + a GitHub org/owner you can push to.
+- **PyYAML** (`pip3 install pyyaml`) — only for the scheduler installer and the DR
+  restore/smoke tooling (they parse `jobs.yaml` and the workspace manifest).
+  `adapt.py` does **not** need it.
 - For the full memory stack: a local Postgres (for [Gbrain](https://github.com/garrytan/gbrain),
   the graph store) and [QMD](https://github.com/tobi/qmd) (the vector index) —
   both installed by `dr/bootstrap.sh`. They're **optional for a first run**; the
   memory skills degrade gracefully if the backends aren't up yet.
-- The DR `bootstrap.sh` targets **macOS** (Homebrew + LaunchAgents). The memory,
-  skills, and self-improvement layers are OS-agnostic.
+
+Run **`bash scripts/preflight.sh`** on any machine to see exactly what's present
+and what's missing, split into required / scheduler / optional.
+
+### Platform support
+
+| Capability | macOS | Linux | Windows |
+|---|:--:|:--:|:--:|
+| `adapt.py` render + apply (the template path) | ✅ | ✅ | ✅¹ |
+| Bundled skills copied/rendered | ✅ | ✅ | ✅¹ |
+| `scrub-audit` / `preflight` | ✅ | ✅ | ✅¹ |
+| Scheduler install (`launchd`) | ✅ | ❌² | ❌² |
+| `dr/bootstrap.sh` full bootstrap | ✅ | ❌² | ❌ |
+| Full Gbrain/QMD live stack | ✅ | ⚠️ manual | ❌ |
+
+¹ Untested but pure Python/bash — use WSL or Git-Bash on Windows.
+² The scheduler ships as macOS **LaunchAgents**; on Linux you'd port `launchd/jobs.yaml`
+to systemd timers or cron yourself. The memory, skills, drift, and self-improvement
+layers are OS-agnostic — only the scheduler and DR bootstrap are macOS-specific.
+
+---
+
+## Security & trust boundary
+
+This harness runs **autonomous local agents** that read and write your filesystem
+and execute the bundled scripts on a schedule. That's the point — but it's also a
+real trust boundary, so install it deliberately:
+
+- **Treat it like code you run, not a sandbox.** Agents inherit the permissions of
+  the user running the LaunchAgents. Run it as your normal user, never root.
+- **Review before you schedule.** Read `launchd/jobs.yaml` — you install exactly
+  those jobs and nothing else runs that isn't declared there.
+- **Secrets stay in `${VAR}` env bindings,** never in tracked files. `scrub-audit`
+  (CI) blocks identifier/secret leaks and the config sanitizer redacts
+  secret-shaped keys before any DR push. Real values live only in your gitignored
+  `openclaw.json`.
+- **Full filesystem/exec access is the current default,** because the harness is
+  built for a single-user local machine. Adapting it for a shared or less-trusted
+  host means scoping down the per-agent skill allowlists (`config/agents.map` +
+  per-agent configs) first. A locked-down default profile is a roadmap item, not
+  today's default — so this is an opt-in-to-broad-trust tool, by design.
 
 ---
 

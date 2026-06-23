@@ -30,6 +30,8 @@ abort(){ err "$1"; exit 1; }
 step "Prereqs"
 command -v qmd >/dev/null 2>&1 || abort "qmd not installed — run bootstrap.sh first"
 ok "qmd: $(command qmd --version 2>/dev/null || echo unknown)"
+command -v python3 >/dev/null 2>&1 || abort "python3 not installed"
+python3 -c 'import yaml' 2>/dev/null || abort "PyYAML required to read index.yml — install: pip3 install pyyaml"
 
 # ----- ensure XDG dirs + index.yml -----
 step "Ensure QMD config in place"

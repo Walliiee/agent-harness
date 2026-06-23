@@ -1,12 +1,17 @@
 #!/usr/bin/env bash
-# smoke-test.sh — post-restore health check.
+# smoke-test.sh — post-bootstrap LIVE-STACK health check.
 #
-# Exits non-zero if any check fails. Designed to be run after bootstrap.sh +
-# restore-gbrain.sh + restore-qmd.sh on a fresh machine, but also useful as a
-# day-to-day health probe.
+# This checks an ALREADY-INSTALLED system: live openclaw.json, QMD/Gbrain
+# services, Postgres, populated indices, loaded LaunchAgents, cloned workspaces.
+# It is NOT a fresh-clone repo check and WILL fail on a bare clone with no live
+# stack — that is expected. For a CLONE-LEVEL check (deps + repo structure +
+# adapt.py render), run `scripts/preflight.sh` instead.
 #
-# Set GH_ORG so the manifest's ${GH_ORG} placeholders resolve when checking
-# workspace remotes.
+# Run after bootstrap.sh + restore-gbrain.sh + restore-qmd.sh on a fresh machine,
+# or as a day-to-day health probe. Exits non-zero if any check fails.
+#
+# Requires PyYAML (the LaunchAgent + workspace checks parse YAML). Set GH_ORG so
+# the manifest's ${GH_ORG} placeholders resolve when checking workspace remotes.
 
 set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -19,6 +24,13 @@ pass() { printf '   %s✓%s %s\n' "$c_green" "$c_reset" "$*"; PASS=$((PASS+1)); 
 fail() { printf '   %s✗%s %s\n' "$c_red" "$c_reset" "$*" >&2; FAIL=$((FAIL+1)); }
 warn() { printf '   %s!%s %s\n' "$c_yellow" "$c_reset" "$*"; WARN=$((WARN+1)); }
 section() { printf '\n%s==>%s %s\n' "$c_blue" "$c_reset" "$*"; }
+
+# PyYAML powers the LaunchAgent + workspace checks. Detect it once so a missing
+# dependency reads as an explicit skip — not a silent "no jobs declared".
+HAVE_YAML=0
+if command -v python3 >/dev/null 2>&1 && python3 -c 'import yaml' 2>/dev/null; then
+  HAVE_YAML=1
+fi
 
 # ----- 1. openclaw config: every ${VAR} reference resolves to a real env value -----
 # It's legitimate for openclaw.json to contain `${VAR}` inside headers (e.g.
@@ -117,7 +129,11 @@ section "LaunchAgents loaded"
 LA_DIR="$HOME/Library/LaunchAgents"
 # Derive expected labels from launchd/jobs.yaml if present; else skip.
 JOBS_YAML="$SCRIPT_DIR/../launchd/jobs.yaml"
-if [[ -f "$JOBS_YAML" ]] && command -v python3 >/dev/null 2>&1; then
+if [[ "$HAVE_YAML" -ne 1 ]]; then
+  warn "PyYAML missing — skipping LaunchAgent check (install: pip3 install pyyaml)"
+elif [[ ! -f "$JOBS_YAML" ]]; then
+  warn "launchd/jobs.yaml not found — skipping LaunchAgent check"
+else
   labels=$(python3 - "$JOBS_YAML" <<'PY'
 import sys, yaml
 m = yaml.safe_load(open(sys.argv[1]))
@@ -136,7 +152,7 @@ PY
     fi
   done <<< "$labels"
   if [[ "$total" -eq 0 ]]; then
-    warn "no jobs declared in jobs.yaml"
+    warn "jobs.yaml parsed but declares no jobs"
   elif [[ "$loaded" -eq "$total" ]]; then
     pass "all $loaded/$total LaunchAgents loaded"
   elif [[ "$loaded" -ge $((total * 80 / 100)) ]]; then
@@ -144,12 +160,13 @@ PY
   else
     fail "only $loaded/$total LaunchAgents loaded"
   fi
-else
-  warn "launchd/jobs.yaml not found — skipping LaunchAgent check"
 fi
 
 # ----- 7. Workspaces cloned at HEAD -----
 section "Workspaces present and clean"
+if [[ "$HAVE_YAML" -ne 1 ]]; then
+  warn "PyYAML missing — skipping workspace check (install: pip3 install pyyaml)"
+else
 while IFS='|' read -r role url path; do
   [[ -z "$role" ]] && continue
   if [[ ! -d "$path/.git" ]]; then
@@ -174,6 +191,7 @@ for w in (m.get('workspaces') or []):
     print(f"{w['role']}|{url}|{path}")
 PY
 )
+fi
 
 # ----- 8. openclaw doctor -----
 section "openclaw doctor"

@@ -12,13 +12,19 @@ piece.
 
 ## 0. Prerequisites
 
-- **Python 3.11+** (the adapt engine is pure stdlib — no `pip install` needed).
+- **Python 3.9+** (the adapt engine is pure stdlib — no `pip install` needed).
 - **git** and a GitHub org/owner you can push to (this becomes `${GH_ORG}`).
+- **PyYAML** (`pip3 install pyyaml`) — only for the scheduler installer and the DR
+  restore/smoke scripts (they parse `jobs.yaml` / the workspace manifest);
+  `adapt.py` itself doesn't need it.
 - A harness home directory (default `~/.openclaw`, referred to as
   `${OPENCLAW_HOME}`).
 - For the full memory stack: a local Postgres (graph store) and the vector-index
   service. These are optional for a first run — the memory skills degrade
   gracefully if the backends aren't up yet.
+
+Run **`bash scripts/preflight.sh`** first — it reports exactly what's present and
+what's missing on this machine, split into required / scheduler / optional.
 
 ---
 
@@ -125,19 +131,27 @@ config; the system daemons (Layer 5b) come from `launchd/`.
 
 ## 5. Verify
 
-Two checks confirm the install is sound.
+There are two kinds of check — a **clone-level** one that works anywhere, and a
+**live-stack** one that only means something after a full bootstrap.
 
 ```bash
-# 5a. DR / smoke test — confirms the bootstrap + restore wiring is intact:
-bash dr/smoke-test.sh
+# 5a. Clone-level — deps, repo structure, and an adapt.py dry-run. Run anywhere,
+#     no live stack needed:
+bash scripts/preflight.sh
 
 # 5b. Leak gate — confirms no secrets/paths/personas leaked into anything you
 #     edited (also runs in CI on every push/PR):
 bash scripts/scrub-audit.sh
+
+# 5c. Live-stack health — checks running services, populated indices, and loaded
+#     LaunchAgents. Only meaningful AFTER bootstrap + restore; EXPECTED to fail on
+#     a bare clone with no live stack:
+bash dr/smoke-test.sh
 ```
 
-A green `scrub-audit` plus a passing `smoke-test` means the harness is wired
-correctly and ships nothing personal.
+A green `preflight` + `scrub-audit` means the repo is sound and ships nothing
+personal. A passing `smoke-test` additionally means a *bootstrapped* system is
+healthy.
 
 You can also spot-check the live system:
 

@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """adapt.py — fit the agent-harness templates to your project.
 
-Pure stdlib (Python 3.11+). No pip deps, no Jinja2 — a tiny ${VAR} substituter
-runs anywhere. The flow is: probe → render → validate → report.
+Pure stdlib (Python 3.9+). No pip deps, no Jinja2 — a tiny ${VAR} substituter
+runs anywhere (annotations are lazy via `from __future__ import annotations`,
+so the builtin-generic hints need no newer runtime). The flow is: probe →
+render → validate → report.
 
   probe()    detect an existing setup (openclaw.json / .claude / codex config),
              infer OPENCLAW_HOME and any existing agent ids.

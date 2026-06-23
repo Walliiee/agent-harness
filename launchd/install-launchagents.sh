@@ -43,6 +43,7 @@ abort(){ err "$1"; exit 1; }
 [[ -f "$JOBS_YAML" ]] || abort "jobs.yaml not found: $JOBS_YAML"
 [[ -f "$TEMPLATE" ]]  || abort "plist.template not found: $TEMPLATE"
 command -v python3 >/dev/null 2>&1 || abort "python3 not installed"
+python3 -c 'import yaml' 2>/dev/null || abort "PyYAML required to parse jobs.yaml — install: pip3 install pyyaml"
 
 [[ "$DRY_RUN" -eq 1 ]] && warn "DRY RUN — no files written, nothing loaded"
 

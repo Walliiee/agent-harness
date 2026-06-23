@@ -1,0 +1,16 @@
+{
+  "name": "agent-harness",
+  "description": "Single-plugin marketplace for the agent-harness install wrapper.",
+  "owner": {
+    "name": "agent-harness"
+  },
+  "plugins": [
+    {
+      "name": "agent-harness",
+      "source": "./",
+      "description": "Guided wrapper around scripts/adapt.py + a clone-level preflight check.",
+      "license": "MIT",
+      "keywords": ["agents", "memory", "disaster-recovery", "scaffolding"]
+    }
+  ]
+}

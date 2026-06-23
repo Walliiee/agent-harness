@@ -1,0 +1,11 @@
+{
+  "name": "agent-harness",
+  "displayName": "Agent Harness",
+  "description": "Fit the agent-harness memory + self-healing + DR templates to your project: a guided wrapper around scripts/adapt.py (probe → dry-run → apply) plus a clone-level preflight check.",
+  "version": "1.0.0",
+  "license": "MIT",
+  "homepage": "https://github.com/${GH_ORG}/agent-harness",
+  "repository": "https://github.com/${GH_ORG}/agent-harness",
+  "keywords": ["agents", "memory", "disaster-recovery", "scaffolding", "templates"],
+  "skills": ["./plugin/skills/"]
+}

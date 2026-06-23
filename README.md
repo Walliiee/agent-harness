@@ -94,10 +94,11 @@ without touching them. Out of the box, though, it's a complete
 
 ## Quick start
 
-> **This is a template repository — not a packaged plugin (yet).** There is no
-> one-command plugin installer; you clone (or **“Use this template”**) and run
-> `adapt.py` to fit it to your machine. A Claude Code plugin / `npx` wrapper is on
-> the [roadmap](#status--roadmap). Platform support varies — the full live stack is
+> **This is a template repository with an optional Claude Code plugin.** Either
+> clone (or **“Use this template”**) and run `adapt.py` directly, or install the
+> bundled **Claude Code plugin** for a guided probe → dry-run → apply flow —
+> see **[docs/plugin.md](docs/plugin.md)**. An `npx` wrapper is still on the
+> [roadmap](#status--roadmap). Platform support varies — the full live stack is
 > macOS-oriented; see [Platform support](#platform-support).
 
 **Use it as a template** (the recommended path): click **“Use this template”** on
@@ -157,6 +158,7 @@ Full walkthrough: **[docs/getting-started.md](docs/getting-started.md)**.
 | `examples/two-agent/` | A minimal `main` + `dev` setup — the shape of what `adapt.py` produces. |
 | `scripts/adapt.py` | The "fit it to your project" engine. |
 | `scripts/scrub-audit.sh` | The leak gate — fails if any identifier/secret/path appears. Runs in CI. |
+| `.claude-plugin/` + `plugin/` | Claude Code plugin manifest + marketplace + the two wrapper skills (`adapt`, `preflight`). Inert until installed — see `docs/plugin.md`. |
 
 ---
 
@@ -279,11 +281,12 @@ real trust boundary, so install it deliberately:
 
 ## Status & roadmap
 
-**v1 — template-repo distribution.** Stable, in daily use, scrub-audit green.
+**v1 — template-repo distribution + Claude Code plugin.** Stable, in daily use,
+scrub-audit green. The repo installs either by cloning + `adapt.py`, or via the
+bundled Claude Code plugin ([docs/plugin.md](docs/plugin.md)).
 
 Next pass (tracked, not yet shipped):
 
-- A **Claude Code plugin** wrapping `scripts/adapt.py` for one-command install.
 - An **`npx skills add`** skill so the bundle installs into any agent project
   without cloning.
 
@@ -305,6 +308,8 @@ clearly (†) so the map never over-promises the bundle.
   rebuild runbook.
 - **[docs/hardening.md](docs/hardening.md)** — opt-in profile to scope an agent
   down for a shared or less-trusted host.
+- **[docs/plugin.md](docs/plugin.md)** — install + use the bundled Claude Code
+  plugin.
 - **[examples/two-agent/](examples/two-agent/)** — the minimal worked example.
 
 ---

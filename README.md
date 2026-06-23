@@ -211,6 +211,27 @@ Other principles the codebase holds to:
 Run **`bash scripts/preflight.sh`** on any machine to see exactly what's present
 and what's missing, split into required / scheduler / optional.
 
+### Tested with
+
+The harness is proven against the versions below — the live stack it was cut
+from. Newer releases are generally fine; **older than the baseline is untested**,
+and `preflight.sh` prints a warn-only note if a tool is below its baseline (it
+never fails the run). This is a floor, not a hard pin: the harness assumes no
+exact version, so you can run whatever your stack settled on.
+
+| Tool | Baseline (floor) | Known-good |
+|------|:---------------:|:----------:|
+| Python (`adapt.py`) | 3.9 | 3.9 |
+| PostgreSQL (Gbrain store) | 17 | 17.10 |
+| Bun (Gbrain install) | 1.3 | 1.3.14 |
+| QMD (vector index) | 2.5 | 2.5.3 |
+| Gbrain (graph store) | 0.42 | 0.42.40 |
+| Ollama (embeddings) | 0.30 | 0.30.0 |
+| OpenClaw (gateway) | 2026.6 | 2026.6.9 |
+
+The floors live in `scripts/preflight.sh` (the `note_opt` calls); keep this table
+and those in sync if you bump either.
+
 ### Platform support
 
 | Capability | macOS | Linux | Windows |

@@ -95,13 +95,42 @@ have gh && ok "gh (GitHub CLI) — $(ver gh --version | head -1)" || warn "gh no
 
 # ---------------------------------------------------------------- OPTIONAL ----
 section "Optional — full live memory stack"
-note_opt() { if have "$1"; then ok "$1 — $2 ($(ver "$1" ${3:---version} 2>/dev/null | head -1))"; else warn "$1 not found — $2 (optional; the memory skills degrade gracefully)"; fi; }
-note_opt psql    "Postgres client (Gbrain graph store)"
-note_opt bun     "Bun runtime (Gbrain install)"
-note_opt qmd     "QMD vector index"
-note_opt gbrain  "Gbrain knowledge graph"
-note_opt ollama  "Ollama (embeddings / local models)"
-note_opt openclaw "OpenClaw gateway"
+
+# vge A B → true (exit 0) if dotted-numeric version A >= B. Pure awk, so it
+# works on macOS bash 3.2 and Linux alike (no `sort -V`, no `declare -A`).
+vge() {
+  awk -v a="$1" -v b="$2" 'BEGIN{
+    na=split(a,A,"."); nb=split(b,B,"."); n=(na>nb)?na:nb;
+    for(i=1;i<=n;i++){x=(i<=na)?A[i]+0:0; y=(i<=nb)?B[i]+0:0;
+      if(x>y)exit 0; if(x<y)exit 1}
+    exit 0}'
+}
+
+# note_opt NAME DESC [VERSION_FLAG] [FLOOR] [TESTED]
+# Optional tool: present → ✓ with its version; if a FLOOR is given and the tool
+# is below it, add a warn-only "below tested baseline" note (never fails the run).
+# FLOOR/TESTED here MUST track the "Tested with" table in README.md.
+note_opt() {
+  local name="$1" desc="$2" vflag="${3:---version}" floor="${4:-}" tested="${5:-}"
+  if have "$name"; then
+    local raw v
+    raw=$(ver "$name" "$vflag" 2>/dev/null | head -1)
+    v=$(printf '%s' "$raw" | grep -oE '[0-9]+(\.[0-9]+){1,3}' | head -1)
+    ok "$name — $desc ($raw)"
+    if [[ -n "$floor" && -n "$v" ]] && ! vge "$v" "$floor"; then
+      warn "  ↳ $name $v is below the tested baseline $floor (known-good: $tested) — untested, update recommended"
+    fi
+  else
+    warn "$name not found — $desc (optional; the memory skills degrade gracefully)"
+  fi
+}
+#         tool      description                          ver-flag    floor    known-good
+note_opt psql    "Postgres client (Gbrain graph store)" --version   17       17.10
+note_opt bun     "Bun runtime (Gbrain install)"         --version   1.3      1.3.14
+note_opt qmd     "QMD vector index"                     --version   2.5      2.5.3
+note_opt gbrain  "Gbrain knowledge graph"               --version   0.42     0.42.40.0
+note_opt ollama  "Ollama (embeddings / local models)"   --version   0.30     0.30.0
+note_opt openclaw "OpenClaw gateway"                    --version   2026.6   2026.6.9
 
 # ------------------------------------------------------------------ SUMMARY ---
 echo

@@ -4,7 +4,7 @@
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
 ![CI: scrub-audit](https://img.shields.io/badge/CI-scrub--audit-brightgreen.svg)
-![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)
+![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue.svg)
 ![Status: v1](https://img.shields.io/badge/status-v1-orange.svg)
 
 Most agent setups remember nothing between sessions, silently rot when an

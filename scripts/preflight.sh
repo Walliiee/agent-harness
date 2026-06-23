@@ -37,7 +37,7 @@ ver()  { "$@" 2>&1 | head -1; }
 # ---------------------------------------------------------------- REQUIRED ----
 section "Required — template path (adapt.py)"
 
-# Python 3.11+
+# Python 3.9+
 if have python3; then
   pyv=$(python3 -c 'import sys;print("%d.%d"%sys.version_info[:2])' 2>/dev/null || echo "?")
   if python3 -c 'import sys;sys.exit(0 if sys.version_info[:2]>=(3,9) else 1)' 2>/dev/null; then

@@ -9,7 +9,7 @@
 
 Most agent setups remember nothing between sessions, silently rot when an
 upgrade strips a guard, and can't be rebuilt when the machine dies. `agent-harness`
-gives any agent stack — [OpenClaw](https://github.com/), Hermes, or a plain
+gives any agent stack — OpenClaw, Hermes, or a plain
 Claude Code / Codex project — the four pieces that are normally hand-rolled,
 fragile, and personal-to-your-machine:
 
@@ -154,7 +154,7 @@ Full walkthrough: **[docs/getting-started.md](docs/getting-started.md)**.
 | `config/` | Templates: `openclaw.json.template`, `agents.map.template`, `gbrain-sources.json.template`, the opt-in `hardened-profile.example.json`, plus a `config-README.md`. |
 | `launchd/` | One `plist.template` + `jobs.yaml` + an installer that renders every scheduler — no hardcoded paths. |
 | `dr/` | `bootstrap.sh` + `restore-*.sh`, `workspaces.manifest.yaml.template`, `smoke-test.sh`, `secrets/README.md`. |
-| `docs/` | `architecture.md` (the full design), `getting-started.md`, `disaster-recovery.md`. |
+| `docs/` | `architecture.md` (the full design), `getting-started.md`, `disaster-recovery.md`, `hardening.md`, `plugin.md`. |
 | `examples/two-agent/` | A minimal `main` + `dev` setup — the shape of what `adapt.py` produces. |
 | `scripts/adapt.py` | The "fit it to your project" engine. |
 | `scripts/scrub-audit.sh` | The leak gate — fails if any identifier/secret/path appears. Runs in CI. |

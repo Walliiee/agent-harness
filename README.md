@@ -282,13 +282,16 @@ real trust boundary, so install it deliberately:
 ## Status & roadmap
 
 **v1 — template-repo distribution + Claude Code plugin.** Stable, in daily use,
-scrub-audit green. The repo installs either by cloning + `adapt.py`, or via the
-bundled Claude Code plugin ([docs/plugin.md](docs/plugin.md)).
+scrub-audit green, and **distribution-complete.** The repo installs two ways:
+by cloning + `adapt.py` (the universal path), or via the bundled Claude Code
+plugin ([docs/plugin.md](docs/plugin.md)) for a guided probe → dry-run → apply.
 
-Next pass (tracked, not yet shipped):
-
-- An **`npx skills add`** skill so the bundle installs into any agent project
-  without cloning.
+> **Why no `npx skills add`?** That installer is for portable, self-contained
+> skill packs — but this harness is a *system*: its skills call into `bin/`
+> scripts and the config `adapt.py` renders, so a skills-only install would be
+> broken. The clone + `adapt.py` path is the correct unit of distribution, and
+> the plugin already covers guided install. So it's a deliberate non-goal, not a
+> gap.
 
 Some roles the architecture describes (`wiki-write`, `session-cleanup`,
 standups, `model-bakeoff`) are part of the broader live system and are **not in
